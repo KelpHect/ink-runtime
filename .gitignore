@@ -12,6 +12,7 @@ vendor/
 
 # Build output
 build/
+build2/
 out/
 *.obj
 *.exe
@@ -32,5 +33,9 @@ nul
 # OS
 Thumbs.db
 .DS_Store
+
+# Scratch build helpers / run dumps
+_build*.bat
+testdata/ink_*/
 testdata/ink_vk/
 testdata/*.log

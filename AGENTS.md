@@ -49,6 +49,17 @@ Expert pack: `tools/make_expertpack.py` → `data/expertpack.v1.bin`.
 - Every recorded copy/dispatch sees buffer contents at execute time: never
   record a copy then reuse the staging region inside the same cb.
 - Expert tensors live in HOST_VISIBLE RAM buffers (host_cache_/host_buf) —
-  GPU streams only selected rows over PCIe; do NOT upload experts to VRAM.
-- `ink --backend vk --dump dir` + tools/compare_golden.py is the correctness
-  gate (argmax must match 8/8; hidden cos >= 0.98).
+  GPU streams only selected rows over PCIe; do NOT upload experts to VRAM
+  (vk backend rule). In `gpu_graph` the opposite is preferred: experts go
+  device-resident while VK_EXT_memory_budget reports headroom (host fallback
+  per-tensor) because...
+- MEASURED (RX 9070 XT, Adrenalin): compute-shader reads of HOST_VISIBLE
+  sysmem cap ~8GB/s aggregate; SDMA vkCmdCopyBuffer RAM->VRAM ~32.5GB/s;
+  host-visible pool ~11GB effective, device heap 15.9GB minus driver reserve.
+- `*_mslot.comp` shaders: slot = gl_WorkGroupID.y — merge all top-k expert
+  dispatches into one (per-dispatch cost dominated); moe_reduce folds the
+  per-slot rows.
+- `ink --backend vk|gpu --dump dir` + `python tools/compare_golden.py gold ink_dir`
+  is the correctness gate (argmax must match 8/8; hidden cos >= 0.98).
+  WATCH OUT: the comparators ignored argv once — always pass real paths and
+  sanity-check one file argmax manually when a PASS looks suspicious.
