@@ -767,6 +767,11 @@ void GpuGraph::emit_visit_b(int i, int p, int part) {
   // (stage_ok_ false — VRAM full) the host mirrors stay bound and the
   // original mslot host-read path runs.
   const bool stage = !L.experts_dev && stage_ok_;
+  // Warm cache: a staged visit with a private w13 set keeps last token's
+  // slices resident; the rest share the single stg_w13w_/stg_w13s_ pair
+  // (always-miss, today's behavior).
+  const int bnd = stage ? stg_bmap_[vidx] : -1;
+  const bool own = bnd >= 0 && wc_own_[bnd];
 
   // MoE: per-slot gate/up (16 unsynced GEMVs), then 8 unsynced w2+swiglu
   // writing per-slot rows (zeroed up front; += semantics inside the shader),
@@ -777,8 +782,10 @@ void GpuGraph::emit_visit_b(int i, int p, int part) {
     fill(moe_rows_, 0, 8 * Hb, 0u, "moe_zero");
     const Pipe& p13 =
         L.mxfp8 ? (stage ? p_mx8st_ : p_mx8m_) : (stage ? p_nv4st_ : p_nv4m_);
-    const Bnd w13b = stage ? BW(stg_w13w_) : BW(*L.w13);
-    const Bnd w13sb = stage ? BW(stg_w13s_) : BW(*L.w13s);
+    const Bnd w13b =
+        stage ? BW(own ? w13w_own_[bnd] : stg_w13w_) : BW(*L.w13);
+    const Bnd w13sb =
+        stage ? BW(own ? w13s_own_[bnd] : stg_w13s_) : BW(*L.w13s);
     // All 8 expert slots in ONE dispatch per weight (slot =
     // gl_WorkGroupID.y): per-dispatch fixed cost, not bandwidth, dominated
     // the per-slot version.
@@ -933,8 +940,24 @@ void GpuGraph::emit_fin() {
 // just written by that visit's router-id readback. Slice/offset math is
 // in BYTES (vkCmdCopyBuffer), unlike BA() which takes float elements.
 // part: 0 = all four tensors (single-phase), 1 = w13 pair, 2 = w2 pair.
-void GpuGraph::stage_copies(const Lw& L, int part) {
+// bnd selects the visit's private w13 buffer set when it has one — the
+// buffer then holds last token's slices, and each slot resolves three
+// ways:
+//   - same slot, same expert: no copy at all (pf_hits)
+//   - expert resident in another slot of the same buffer: a device-local
+//     buf->buf copy (~10x cheaper than the PCIe pull) — emitted first, in
+//     an order where every source slot still holds resident data
+//     (pf_devs)
+//   - cold: the host-mirror pull as before (pf_misses)
+// Cross-slot reuse is what makes this pay: the router's top-8 MEMBERSHIP
+// is stable token-to-token (~40%) but the ORDER shuffles, so pure
+// positional hits are rare (~10%).
+void GpuGraph::stage_copies(const Lw& L, int part, int bnd) {
   const int64_t E = cfg_->n_routed_experts;
+  // The private w13 set only exists when this visit won VRAM — a cold
+  // visit falls back to the single shared buffer (the emit side does the
+  // same pick via `own`).
+  const bool warm = bnd >= 0 && bnd < (int)wc_own_.size() && wc_own_[bnd];
   const struct Tn {
     const vk::Buffer* s;
     const vk::Buffer* d;
@@ -942,14 +965,83 @@ void GpuGraph::stage_copies(const Lw& L, int part) {
     int want;
     const char* tag;
   } T[4] = {
-      {L.w13, &stg_w13w_, L.sl13w, 1, "stg13w"},
-      {L.w13s, &stg_w13s_, L.sl13s, 1, "stg13s"},
+      {L.w13, warm ? &w13w_own_[bnd] : &stg_w13w_, L.sl13w, 1, "stg13w"},
+      {L.w13s, warm ? &w13s_own_[bnd] : &stg_w13s_, L.sl13s, 1, "stg13s"},
       {L.w2, &stg_w2w_, L.sl2w, 2, "stg2w"},
       {L.w2s, &stg_w2s_, L.sl2s, 2, "stg2s"},
   };
+  // plan the w13 slots once — the same hit/dev/miss decision applies to
+  // both the weight and the scale tensor (identical slot geometry).
+  int devsrc[8];    // warm+want1: dev-copy source slot, -1 = host, -2 = hit
+  char plan[8] = {};
+  if (warm) {
+    char donated[8] = {};
+    for (int s = 0; s < 8; s++) {
+      int64_t e = stage_ids_[s];
+      if (e < 0 || e >= E) e = 0;
+      stats.pf_slots++;
+      if (e == int64_t(last_ids_[bnd * 8 + s])) {
+        stats.pf_hits++;
+        devsrc[s] = -2;
+        continue;
+      }
+      int t = -1;
+      for (int u = 0; u < 8; u++)
+        if (u != s && !donated[u] &&
+            last_ids_[bnd * 8 + u] == int32_t(e)) {
+          t = u;
+          break;
+        }
+      if (t >= 0) {
+        donated[t] = 1;
+        devsrc[s] = t;
+        plan[s] = 1;
+        stats.pf_devs++;
+      } else {
+        devsrc[s] = -1;
+        stats.pf_misses++;
+      }
+    }
+  }
   VkBufferCopy regs[8];
   for (const Tn& t : T) {
     if (t.sl <= 0 || (part != 0 && t.want != part)) continue;
+    if (t.want == 1 && warm) {
+      // dev copies first, threatened sources earliest: a copy may only read
+      // a slot that no already-emitted copy overwrote. Whatever remains
+      // cyclic (e.g. a 2-swap) downgrades to a host pull — rare and cheap.
+      uint32_t nd = 0;
+      char done[8] = {};
+      for (int it = 0; it < 8; it++) {
+        int pick = -1, fallback = -1;
+        for (int s = 0; s < 8; s++) {
+          if (plan[s] != 1 || done[s]) continue;
+          const int ts = devsrc[s];
+          if (done[ts]) continue;  // src slot already overwritten
+          if (plan[ts] != 0 && !done[ts]) { pick = s; break; }
+          fallback = s;
+        }
+        const int s = (pick >= 0) ? pick : fallback;
+        if (s < 0) break;  // only dead-src devs left -> host-fallback below
+        regs[nd++] = {VkDeviceSize(devsrc[s]) * VkDeviceSize(t.sl),
+                      VkDeviceSize(s) * VkDeviceSize(t.sl),
+                      VkDeviceSize(t.sl)};
+        done[s] = 1;
+      }
+      if (nd) cpr(*t.d, *t.d, regs, nd, t.tag);
+      uint32_t n = 0;
+      for (int s = 0; s < 8; s++) {
+        if (devsrc[s] == -2) continue;            // positional hit
+        if (plan[s] == 1 && done[s]) continue;    // dev-copied
+        int64_t e = stage_ids_[s];
+        if (e < 0 || e >= E) e = 0;
+        regs[n++] = {VkDeviceSize(e) * VkDeviceSize(t.sl),
+                     VkDeviceSize(s) * VkDeviceSize(t.sl),
+                     VkDeviceSize(t.sl)};
+      }
+      if (n) cpr(*t.s, *t.d, regs, n, t.tag);
+      continue;
+    }
     for (int s = 0; s < 8; s++) {
       int64_t e = stage_ids_[s];
       if (e < 0 || e >= E) e = 0;  // clamp: a bad id must never index OOB
@@ -960,6 +1052,7 @@ void GpuGraph::stage_copies(const Lw& L, int part) {
     cpr(*t.s, *t.d, regs, 8, t.tag);
   }
 }
+
 
 // ------------------------------------------------------------------- token
 // emit_token: the BUILD walker — visits in order, each as a() then b(),
@@ -1048,8 +1141,6 @@ bool GpuGraph::record_segments() {
         return false;
       }
       rec_ = nullptr;
-      staged_layer_.push_back(i);
-      staged_vidx_.push_back(c.visit_index(i, p));
       if (!open_seg()) return false;
       ts_gap();  // cb-start mark; segment = the inter-submit gap
       if (split_stg_) {
@@ -1160,7 +1251,7 @@ const std::vector<float>& GpuGraph::forward_token(int token, int64_t pos) {
     }
     rec_ = tr;
     ts_off_ = true;  // no timestamps on the transfer queue
-    stage_copies(lw_[staged_layer_[k]], part);
+    stage_copies(lw_[staged_layer_[k]], part, int(k));
     ts_off_ = false;
     rec_ = nullptr;
     if (!tr->end()) {
@@ -1248,6 +1339,12 @@ const std::vector<float>& GpuGraph::forward_token(int token, int64_t pos) {
     } else {
       if (!do_trec(k, 0, nullptr)) { fail = true; break; }
     }
+    // Boundary k's slots now hold the fresh ids: commit them as the warm
+    // state for next token's hit test (AFTER the miss/dev list was
+    // recorded — the compare reads last_ids_). The private buffer keeps
+    // them resident until this visit's next boundary, no prefetch needed.
+    if (!last_ids_.empty())
+      std::memcpy(&last_ids_[k * 8], stage_ids_, 32);
   }
   if (!fail) {
     // The final compute fence implies every transfer signal was consumed,
@@ -1635,6 +1732,46 @@ bool GpuGraph::init(const ModelConfig& c, const WeightStore& w,
         for (vk::Buffer* b : {&stg_w13w_, &stg_w13s_, &stg_w2w_, &stg_w2s_})
           if (b->buf) alloc.free(*b);
       }
+      // Staged-boundary tables, once, here: emit_visit_b's buffer pick
+      // (build walk) and forward_token's per-boundary bookkeeping both read
+      // them, so they must exist before emit_token below — record_segments
+      // only consults staged_layer_/staged_vidx_ for the boundary splits.
+      for (int s = 0; s < 48; s++) stg_bmap_[s] = -1;
+      for (int s = 0; s < 48; s++) {
+        int i, p;
+        visit_ip(c, s, i, p);
+        if (!lw_[i].experts_dev && stage_ok_) {
+          stg_bmap_[c.visit_index(i, p)] = int(staged_layer_.size());
+          staged_layer_.push_back(i);
+          staged_vidx_.push_back(c.visit_index(i, p));
+        }
+      }
+      const size_t nst0 = staged_layer_.size();
+      last_ids_.assign(nst0 * 8, int32_t(-1));
+      // Per-visit warm sets, greedily: a visit with a private 8-slot
+      // w13w/w13s pair keeps last token's slices resident between tokens —
+      // no prefetch traffic, ~40% of slots then resolve without a PCIe
+      // pull. Failures just leave that visit on the shared buffer.
+      w13w_own_.resize(nst0);
+      w13s_own_.resize(nst0);
+      wc_own_.assign(nst0, 0);
+      if (std::getenv("INK_NOWARM") == nullptr) {
+        int nw = 0;
+        for (size_t b = 0; b < nst0; b++) {
+          const Lw& L = lw_[staged_layer_[b]];
+          const std::string e_warm = err_;
+          w13w_own_[b] = dev(8 * L.sl13w);
+          w13s_own_[b] = dev(8 * L.sl13s);
+          wc_own_[b] = w13w_own_[b].buf && w13s_own_[b].buf;
+          if (!wc_own_[b]) {
+            err_ = e_warm;
+            if (w13w_own_[b].buf) alloc.free(w13w_own_[b]);
+            if (w13s_own_[b].buf) alloc.free(w13s_own_[b]);
+          } else nw++;
+        }
+        std::fprintf(stderr, "gpu backend: warm w13 caches for %d/%d "
+                     "staged visits\n", nw, int(nst0));
+      }
     }
   }
   if (!missing.empty()) {
@@ -1766,6 +1903,7 @@ void GpuGraph::shutdown() {
   for (auto& t : trec2_) t->shutdown();
   trec13_.clear();
   trec2_.clear();
+  last_ids_.clear();
   staged_layer_.clear();
   staged_vidx_.clear();
   if (seg_fence_) ctx_->destroy_fence(seg_fence_);
@@ -1784,6 +1922,13 @@ void GpuGraph::shutdown() {
                         &stg_w13w_, &stg_w13s_, &stg_w2w_, &stg_w2s_};
   for (auto* b : bufs)
     if (b->buf) alloc_->free(*b);
+  for (auto& b : w13w_own_)
+    if (b.buf) alloc_->free(b);
+  for (auto& b : w13s_own_)
+    if (b.buf) alloc_->free(b);
+  w13w_own_.clear();
+  w13s_own_.clear();
+  wc_own_.clear();
   Pipe* pipes[] = {&p_rms_, &p_mvf_, &p_mvb_, &p_mv8_, &p_cvs_, &p_cvd_,
                    &p_rel_, &p_sco_, &p_smx_, &p_acc_, &p_ares_, &p_msg_,
                    &p_rtr_, &p_moe_, &p_mred_, &p_moem_, &p_nv4m_, &p_mx8m_,

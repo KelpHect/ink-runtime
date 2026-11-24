@@ -60,6 +60,9 @@ class GpuGraph {
   struct Stats {
     uint64_t submits = 0, dispatches = 0, copies = 0, barriers = 0;
     uint64_t uploads = 0, upload_bytes = 0;
+    // warm-cache bookkeeping: w13 slots -> no-copy hits / device copies /
+    // host-mirror PCIe pulls
+    uint64_t pf_slots = 0, pf_hits = 0, pf_devs = 0, pf_misses = 0;
     double record_ms = 0, wait_ms = 0;
   } stats;
 
@@ -176,7 +179,7 @@ class GpuGraph {
   // Record-mode helper: 4 vkCmdCopyBuffer slices per top-k slot for one
   // host-resident layer (32 copies; no-ops while building_). part 0 = all
   // four tensors, 1 = w13 weight+scale only, 2 = w2 weight+scale only.
-  void stage_copies(const Lw& L, int part);
+  void stage_copies(const Lw& L, int part, int bnd);
 
   const ModelConfig* cfg_ = nullptr;
   ink::vk::Context* ctx_ = nullptr;
@@ -206,6 +209,15 @@ class GpuGraph {
   // dev-local expert-slice staging for host-resident layers: 8 slots x the
   // max per-expert slice of each tensor (w13 weight/scale, w2 weight/scale)
   ink::vk::Buffer stg_w13w_, stg_w13s_, stg_w2w_, stg_w2s_;
+  // Per-visit warm w13 staging: a staged visit that won VRAM keeps its OWN
+  // 8-slot weight+scale buffers, so last token's routed slices are still
+  // resident at this token's boundary — same-slot hits skip the PCIe pull
+  // entirely and cross-slot reuse takes a cheap device-local copy. The
+  // router's top-8 MEMBERSHIP is stable token-to-token (~40% set overlap)
+  // even though positions shuffle — that overlap is what the copies save.
+  // Visits without a private set share stg_w13w_/stg_w13s_ (always-miss).
+  std::vector<ink::vk::Buffer> w13w_own_, w13s_own_;  // [boundary]
+  std::vector<char> wc_own_;                        // boundary -> set live
   int32_t stage_ids_[8] = {};  // last readback of the router's top-k ids
   // false when the staging alloc failed (VRAM full): host-resident layers
   // then keep the original mslot host-read path instead of staging.
@@ -242,6 +254,11 @@ class GpuGraph {
   std::vector<std::unique_ptr<ink::vk::Recorder>> trec13_, trec2_;
   std::vector<int> staged_layer_;  // segment boundary k -> staged visit's layer
   std::vector<int> staged_vidx_;   // boundary k -> visit index (sentinel slot)
+  int stg_bmap_[48] = {};          // visit index -> staged boundary (-1)
+  // Warm staging state: last_ids_[bnd*8+s] is the expert id last
+  // programmed into slot s of boundary bnd's private w13 buffer. -1 =
+  // cold (never programmed — first token copies everything).
+  std::vector<int32_t> last_ids_;
   // Two-phase staging: w13 copies feed their own segment while the w2
   // copies keep streaming on the SDMA queue (needs a dedicated transfer
   // queue + timeline semaphore; otherwise single-phase as before).

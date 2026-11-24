@@ -24,26 +24,39 @@ INK_GPU_TS=1 and INK_IDS router dumps (`--backend vk`, 25 prompt + 8 gen).
 - Union of ids per visit over 8 tokens: ~29/128 — modest pool per visit.
 - (An earlier estimate of 13% was wrong; measured directly here.)
 
-## Design: warm per-visit slot caches + transfer-queue prefetch
+## What shipped: per-visit persistent w13 buffers (no prefetch)
 
-1. Each staged visit gets a persistent 8-slot VRAM cache holding
-   {w13,w13s,w2,w2s} slices for the LAST token's routed experts
-   (~25MB/visit × ~21 visits ≈ 525MB — budget against resident-expert space).
-2. At token start (or better: during the previous token's tail), the host
-   issues prefetch copies for each staged visit's previous-token ids onto
-   the transfer queue — the copy engine is otherwise idle during compute.
-   ~43% land as hits for the real ids.
-3. On the visit_a fence: read real ids; copy ONLY misses (~57% ≈ 14MB ≈
-   0.45ms); hits are already in the right slot iff slot assignment is kept
-   positional — i.e. prefetch writes slice for last_ids[k] into slot k, and
-   misses re-fill slot k with the new id. (Reorder so hit slots keep their
-   expert; or add a small id→slot remap the stage shaders read — they
-   already index by slot, so simplest is: slot k always serves position k,
-   prefetch guesses last_ids[k]→slot k, misses overwrite.)
-4. Semaphore-sync the copies into visit_b (agent A's work) — no host wait.
+Measured iterations (RX 9070 XT, submits≈392 config ≈ 11–12 staged
+visits; copies class = GPU time in `*/submit_gap copies` stages):
 
-Expected staged-visit cost: visit_a (~1.5ms) + fence ~0.3ms + miss copies
-~0.5ms + visit_b ≈ gap ~1ms vs ~3ms now → saves ~2ms × 21 ≈ **~40ms/token**.
+- **Prefetch killed by traffic, not hits.** Same-queue prefetch of last
+  token's ids: copies 27.15ms, gpu-busy ~77ms. Second SDMA queue +
+  3-buffer rotation + prefetch 2-ahead: gaps ~1ms but copies 31.63ms,
+  gpu-busy 81.32ms — prefetch ADDS ~56% PCIe traffic which itself loads
+  the link, and the in-order transfer queue overruns the ~2ms boundary
+  window anyway.
+- **43.4% is SET overlap, not positional.** Router membership is stable
+  but slot ORDER shuffles: positional hit rate measured only ~10%
+  (`hit=232 miss=2072` in the prefetch run). Positional prefetch is
+  worthless on its own.
+- **Fix: cross-slot dev copies, zero prefetch.** Each staged visit keeps
+  a private 8-slot w13w/w13s pair (~15MB/visit) that retains last token's
+  slices. On the ids readback, each slot resolves: same slot+expert → no
+  copy (hit); expert resident in another slot of that visit's buffer →
+  device-local `buf→buf` copy (~25µs vs ~100µs PCIe, dev); cold → host
+  mirror pull (miss). Dev copies are emitted in threatened-src-first
+  order so every source still holds resident data. No extra PCIe traffic
+  at all — the 40% coverage is free.
+- **Result** (16 tokens): `warm{slots=3072 hit=288 dev=954 miss=1830}` =
+  40.4% non-PCIe coverage — the full set-overlap. copies **16.80
+  ms/token** (baseline 24.04, -30%), gpu-busy **66.68 ms/token** (~69–73
+  baseline), worst submit_gap for copies 1.78ms. Gate: worst_cos=0.989611.
+- `INK_NOWARM=1` disables (per-visit allocs skipped, visits fall back to
+  the shared staging buffer). Per-visit sets are allocated greedily in
+  init; a visit that doesn't fit stays on the shared buffer.
+- w2/w2s are NOT cached: they stage in pass2 of the same boundary, ~5ms
+  after the ids are read — plenty of in-window time for plain copies, and
+  doubling the cache size for them isn't worth it.
 
 ## Secondary levers (same area)
 
