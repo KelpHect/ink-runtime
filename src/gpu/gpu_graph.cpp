@@ -77,6 +77,25 @@ inline uint32_t wg64(int64_t n) { return uint32_t((n + GRP - 1) / GRP); }
 static std::string lname(int i, const char* s) {
   return "model.llm.layers." + std::to_string(i) + "." + s;
 }
+// Visit number s in 0..47 -> (layer i, pass p) in emit order:
+// prelude i<core_start (p=0), loop layers x num_passes, coda i>=core_end
+// (p=0). visit_index(i,p) == s for every pair produced here.
+void visit_ip(const ModelConfig& c, int s, int& i, int& p) {
+  if (s < c.loop.core_start) {
+    i = s;
+    p = 0;
+    return;
+  }
+  const int nc = c.loop.core_end - c.loop.core_start;
+  const int r = s - c.loop.core_start;
+  if (r < c.loop.num_passes * nc) {
+    p = r / nc;
+    i = c.loop.core_start + r % nc;
+    return;
+  }
+  i = c.loop.core_end + (r - c.loop.num_passes * nc);
+  p = 0;
+}
 }  // namespace
 
 // ---------------------------------------------------------------- helpers
@@ -279,7 +298,7 @@ static uint8_t ts_class(const char* name) {
 }
 
 void GpuGraph::ts_mark(const char* name, const char* tag) {
-  if (!ts_en_) return;
+  if (!ts_en_ || ts_off_) return;
   const uint32_t slot = ts_next_++;
   if (slot >= ts_cap_) return;  // pool exhausted: count but don't write
   rec_->write_timestamp(ts_pool_, slot);
@@ -294,6 +313,20 @@ void GpuGraph::ts_mark(const char* name, const char* tag) {
     std::string l = seen ? base + "." + std::to_string(seen) : base;
     seen++;
     ts_segs_.push_back({std::move(l), ts_class(name), cur_phase_, 0.0});
+  }
+}
+
+void GpuGraph::ts_gap() {
+  if (!ts_en_) return;
+  const uint32_t slot = ts_next_++;
+  if (slot >= ts_cap_) return;
+  rec_->write_timestamp(ts_pool_, slot);
+  if (ts_segs_.size() < slot) {
+    // Boundary at a new command buffer's start: the delta back to the
+    // previous mark is the inter-submit gap (fence wait + host record).
+    std::string l = cur_scope_;
+    l += "/submit_gap";
+    ts_segs_.push_back({std::move(l), 5, cur_phase_, 0.0});
   }
 }
 
@@ -368,6 +401,16 @@ void GpuGraph::ts_report() const {
                  i + 1, s.label.c_str(), kCls[s.cls], kPh[s.phase],
                  s.ms / 1e6 / tok, 100.0 * s.ms / ts_gpu_ms_);
   }
+  if (std::getenv("INK_GPU_TS_FULL")) {
+    std::fprintf(stderr, "gpu-ts: -- all %zu stages (ms/token) --\n",
+                 ts_segs_.size());
+    for (uint32_t i = 0; i < ord.size(); i++) {
+      const TsSeg& s = ts_segs_[ord[i]];
+      std::fprintf(stderr, "gpu-ts:   %-24s %-11s %-7s %8.4f ms\n",
+                   s.label.c_str(), kCls[s.cls], kPh[s.phase],
+                   s.ms / 1e6 / tok);
+    }
+  }
 }
 
 void GpuGraph::sync() {
@@ -380,7 +423,7 @@ void GpuGraph::sync() {
 
 // ------------------------------------------------------------------ visit
 
-void GpuGraph::emit_visit(int i, int p, int64_t pos) {
+void GpuGraph::emit_visit_a(int i, int p, int64_t pos) {
   const ModelConfig& c = *cfg_;
   const int H = H_;
   const int64_t Hb = int64_t(H) * 4;
@@ -642,10 +685,51 @@ void GpuGraph::emit_visit(int i, int p, int64_t pos) {
        &pc, sizeof(pc), 1, 1, "router");
   }
   sync();
+  // host handoff for expert staging: the router's top-k ids are read back
+  // after this submit's fence and program the next submit's slice copies.
+  cp(ridx_, 0, readback_, VkDeviceSize(rb_ids_) * 4, 32, "ids");
   if (dbg && !building_) {
     cp(ridx_, 0, readback_, (rb_dbg_ + int64_t(13) * H) * 4, 32);
     cp(rw_, 0, readback_, (rb_dbg_ + int64_t(13) * H) * 4 + 32, 32);
   }
+}
+
+// ---------------------------------------------------- visit tail (MoE->out)
+
+// emit_visit_b: the part of a visit that needs the router result on the
+// host before it can be recorded — staged expert-slice copies, then the
+// expert GEMVs (mslot for dev-resident layers, *_stage over stg_*_ for
+// host-resident ones), moe_reduce, mlp conv, residual add, dump cp and the
+// host-side counters. In the record walk it is emitted at the head of the
+// submit AFTER emit_visit_a(i,p)'s, so ridx_/rw_ still hold this visit's
+// router output and stage_ids_ carries its freshly read top-k ids.
+void GpuGraph::emit_visit_b(int i, int p) {
+  const ModelConfig& c = *cfg_;
+  const int H = H_;
+  const int64_t Hb = int64_t(H) * 4;
+  const int vidx = c.visit_index(i, p);
+  const int slot = c.cache_slot(i, p);
+  const Lw& L = lw_[i];
+  const int64_t I = c.intermediate_size;
+  cur_scope_ = "v" + std::to_string(vidx);
+  cur_phase_ =
+      vidx < 6 ? 0 : vidx < 18 ? 1 : vidx < 30 ? 2 : vidx < 42 ? 3 : 4;
+  const bool dbg = dbg_en_ && vidx == 5;
+  auto dbg_cp = [&](const vk::Buffer& s, int row) {
+    if (dbg && !building_)
+      cp(s, 0, readback_, (rb_dbg_ + int64_t(row) * H) * 4, s.size, "dbg");
+  };
+  // residual source for out_add — same pick as emit_visit_a's block push.
+  const vk::Buffer* resid =
+      (i % c.n_layers_per_attn_res_block == 0) ? &a_out_ : &residual_;
+
+  // Host-resident experts with staging live: forward_token already ran
+  // this visit's slice copies on the transfer queue (SDMA, overlapped
+  // with this compute cb's record); the stage shaders then read stg_*_
+  // instead of streaming weights over PCIe per GEMV. Without staging
+  // (stage_ok_ false — VRAM full) the host mirrors stay bound and the
+  // original mslot host-read path runs.
+  const bool stage = !L.experts_dev && stage_ok_;
 
   // MoE: per-slot gate/up (16 unsynced GEMVs), then 8 unsynced w2+swiglu
   // writing per-slot rows (zeroed up front; += semantics inside the shader),
@@ -653,33 +737,38 @@ void GpuGraph::emit_visit(int i, int p, int64_t pos) {
   // streams overlap on the link instead of serializing behind per-slot
   // barriers — w2 bytes are ~1/3 of the per-token PCIe traffic.
   fill(moe_rows_, 0, 8 * Hb, 0u, "moe_zero");
-  const Pipe& p13 = L.mxfp8 ? p_mx8m_ : p_nv4m_;
-  const int64_t I = c.intermediate_size;
+  const Pipe& p13 =
+      L.mxfp8 ? (stage ? p_mx8st_ : p_mx8m_) : (stage ? p_nv4st_ : p_nv4m_);
+  const Bnd w13b = stage ? BW(stg_w13w_) : BW(*L.w13);
+  const Bnd w13sb = stage ? BW(stg_w13s_) : BW(*L.w13s);
+  const Bnd w2b = stage ? BW(stg_w2w_) : BW(*L.w2);
+  const Bnd w2sb = stage ? BW(stg_w2s_) : BW(*L.w2s);
+  const Pipe& pac = stage ? p_moest_ : p_moem_;
   // All 8 expert slots in ONE dispatch per weight (slot = gl_WorkGroupID.y):
   // per-dispatch fixed cost, not bandwidth, dominated the per-slot version.
   if (L.mxfp8) {
     sh::PcMxfp8 pg{0u, uint32_t(L.w13R), uint32_t(H), 0u, 2u, 1.f, 0u};
-    op(p13, {BW(*L.w13), BW(*L.w13s), BW(mn_), BW(gate_), BW(ridx_)}, &pg,
-       sizeof(pg), uint32_t(I), 8, "w13");
+    op(p13, {w13b, w13sb, BW(mn_), BW(gate_), BW(ridx_)}, &pg, sizeof(pg),
+       uint32_t(I), 8, "w13");
     sh::PcMxfp8 pu{0u, uint32_t(L.w13R), uint32_t(H), 1u, 2u, 1.f, 0u};
-    op(p13, {BW(*L.w13), BW(*L.w13s), BW(mn_), BW(up_), BW(ridx_)}, &pu,
-       sizeof(pu), uint32_t(I), 8, "w13");
+    op(p13, {w13b, w13sb, BW(mn_), BW(up_), BW(ridx_)}, &pu, sizeof(pu),
+       uint32_t(I), 8, "w13");
   } else {
     sh::PcNvfp4 pg{0u, uint32_t(L.w13R), uint32_t(H), 0u, 2u, 1.f, 0u};
-    op(p13, {BW(*L.w13), BW(*L.w13s), BW(*L.w13a), BW(*L.w13o), BW(mn_),
-             BW(gate_), BW(ridx_)},
+    op(p13, {w13b, w13sb, BW(*L.w13a), BW(*L.w13o), BW(mn_), BW(gate_),
+             BW(ridx_)},
        &pg, sizeof(pg), uint32_t(I), 8, "w13");
     sh::PcNvfp4 pu{0u, uint32_t(L.w13R), uint32_t(H), 1u, 2u, 1.f, 0u};
-    op(p13, {BW(*L.w13), BW(*L.w13s), BW(*L.w13a), BW(*L.w13o), BW(mn_),
-             BW(up_), BW(ridx_)},
+    op(p13, {w13b, w13sb, BW(*L.w13a), BW(*L.w13o), BW(mn_), BW(up_),
+             BW(ridx_)},
        &pu, sizeof(pu), uint32_t(I), 8, "w13");
   }
   sync();
   {
     sh::PcMoeAccum pc{0u, uint32_t(L.w2R), uint32_t(I), L.mxfp8 ? 1u : 0u,
                       float(c.mlp_gate_softcap), float(c.mlp_up_softcap), 0.f};
-    op(p_moem_,
-       {BW(gate_), BW(up_), BW(*L.w2), BW(*L.w2s), BW(*L.w2a), BW(*L.w2o),
+    op(pac,
+       {BW(gate_), BW(up_), w2b, w2sb, BW(*L.w2a), BW(*L.w2o),
         BW(moe_rows_), BW(ridx_), BW(rw_)},
        &pc, sizeof(pc), uint32_t(H), 8, "w2");
   }
@@ -714,12 +803,13 @@ void GpuGraph::emit_visit(int i, int p, int64_t pos) {
     conv_filled_[slot][st] = std::min(3, conv_filled_[slot][st] + 1);
 }
 
-void GpuGraph::emit_token(int token, int64_t pos) {
+// ------------------------------------------------------- token sub-sections
+
+void GpuGraph::emit_head(int token, int64_t pos) {
   const ModelConfig& c = *cfg_;
   const int H = H_;
-  const int64_t Hb = int64_t(H) * 4;
   nblock_ = 0;
-
+  (void)pos;
   cur_scope_ = "pre";  // INK_GPU_TS: non-visit sections get an explicit scope
   cur_phase_ = 0;
   {
@@ -728,9 +818,10 @@ void GpuGraph::emit_token(int token, int64_t pos) {
        "embed");
   }
   sync();
+}
 
-  for (int i = 0; i < c.loop.core_start; i++) emit_visit(i, 0, pos);
-
+void GpuGraph::emit_snap() {
+  const int64_t Hb = int64_t(H_) * 4;
   // prelude snapshot: pre_partial = partial; pre_block = block
   cur_scope_ = "snap";
   cp(partial_, 0, pre_partial_, 0, Hb, "snap_p");
@@ -738,26 +829,26 @@ void GpuGraph::emit_token(int token, int64_t pos) {
   for (int r = 0; r < nblock_; r++)
     cp(block_, int64_t(r) * Hb, pre_block_, int64_t(r) * Hb, Hb, "snap_b");
   sync();
+}
 
-  for (int p = 0; p < c.loop.num_passes; p++) {
-    if (p > 0) {
-      // bank0 = block.back() (last loop-boundary block), bank1 = prev partial
-      cur_scope_ = "bank";
-      cur_phase_ = uint8_t(1 + p);  // restore work belongs to this pass
-      cp(block_, int64_t(nblock_ - 1) * Hb, bank_, 0, Hb, "bank0");
-      cp(partial_, 0, bank_, Hb, Hb, "bank1");
-      cp(pre_partial_, 0, partial_, 0, Hb, "rst_p");
-      for (int r = 0; r < pre_nblock_; r++)
-        cp(pre_block_, int64_t(r) * Hb, block_, int64_t(r) * Hb, Hb, "rst_b");
-      nblock_ = pre_nblock_;
-      sync();
-    }
-    for (int i = c.loop.core_start; i < c.loop.core_end; i++)
-      emit_visit(i, p, pos);
-  }
-  for (int i = c.loop.core_end; i < c.num_hidden_layers; i++)
-    emit_visit(i, 0, pos);
+void GpuGraph::emit_bank(int p) {
+  const int64_t Hb = int64_t(H_) * 4;
+  // bank0 = block.back() (last loop-boundary block), bank1 = prev partial
+  cur_scope_ = "bank";
+  cur_phase_ = uint8_t(1 + p);  // restore work belongs to this pass
+  cp(block_, int64_t(nblock_ - 1) * Hb, bank_, 0, Hb, "bank0");
+  cp(partial_, 0, bank_, Hb, Hb, "bank1");
+  cp(pre_partial_, 0, partial_, 0, Hb, "rst_p");
+  for (int r = 0; r < pre_nblock_; r++)
+    cp(pre_block_, int64_t(r) * Hb, block_, int64_t(r) * Hb, Hb, "rst_b");
+  nblock_ = pre_nblock_;
+  sync();
+}
 
+void GpuGraph::emit_fin() {
+  const ModelConfig& c = *cfg_;
+  const int H = H_;
+  const int64_t Hb = int64_t(H) * 4;
   // final learned attn_res read + rmsnorm + unembed + softcap
   cur_scope_ = "fin";
   cur_phase_ = 5;
@@ -786,6 +877,59 @@ void GpuGraph::emit_token(int token, int64_t pos) {
   cp(logits_, 0, readback_, 0, VkDeviceSize(V_) * 4, "logits");
 }
 
+// ------------------------------------------------------- expert-slice stage
+
+// 32 vkCmdCopyBuffer slices (4 tensors x 8 top-k slots) for one
+// host-resident layer: expert ids[s] -> slot s of each stg_*_ buffer.
+// Recorded into a transfer-queue cb submitted right after the visit's
+// compute cb fences — stage_ids_ was just written by that visit's
+// router-id readback. Slice/offset math is in BYTES (vkCmdCopyBuffer),
+// unlike BA() which takes float element counts.
+void GpuGraph::stage_copies(const Lw& L) {
+  const int64_t E = cfg_->n_routed_experts;
+  for (int s = 0; s < 8; s++) {
+    int64_t e = stage_ids_[s];
+    if (e < 0 || e >= E) e = 0;  // clamp: a bad id must never index OOB
+    const VkDeviceSize eo = VkDeviceSize(e);
+    const VkDeviceSize so = VkDeviceSize(s);
+    if (L.sl13w > 0)
+      cp(*L.w13, eo * VkDeviceSize(L.sl13w), stg_w13w_,
+         so * VkDeviceSize(L.sl13w), VkDeviceSize(L.sl13w), "stg13w");
+    if (L.sl13s > 0)
+      cp(*L.w13s, eo * VkDeviceSize(L.sl13s), stg_w13s_,
+         so * VkDeviceSize(L.sl13s), VkDeviceSize(L.sl13s), "stg13s");
+    if (L.sl2w > 0)
+      cp(*L.w2, eo * VkDeviceSize(L.sl2w), stg_w2w_,
+         so * VkDeviceSize(L.sl2w), VkDeviceSize(L.sl2w), "stg2w");
+    if (L.sl2s > 0)
+      cp(*L.w2s, eo * VkDeviceSize(L.sl2s), stg_w2s_,
+         so * VkDeviceSize(L.sl2s), VkDeviceSize(L.sl2s), "stg2s");
+  }
+}
+
+// ------------------------------------------------------------------- token
+// emit_token: the BUILD walker — visits in order, each as a() then b(),
+// with the mid-token sections between them. The record walk in
+// forward_token produces the identical flat op() sequence (submits split
+// only between a staged visit's a(v) and b(v); copies add no sites).
+void GpuGraph::emit_token(int token, int64_t pos) {
+  const ModelConfig& c = *cfg_;
+  emit_head(token, pos);
+  for (int s = 0; s < 48; s++) {
+    if (s == 6)
+      emit_snap();
+    else if (s == 18)
+      emit_bank(1);
+    else if (s == 30)
+      emit_bank(2);
+    int i, p;
+    visit_ip(c, s, i, p);
+    emit_visit_a(i, p, pos);
+    emit_visit_b(i, p);
+  }
+  emit_fin();
+}
+
 // -------------------------------------------------------------------- api
 
 void GpuGraph::reset() {
@@ -801,37 +945,136 @@ const float* GpuGraph::visit_dump(int vidx, int phase) const {
 const float* GpuGraph::dbg(int row) const { return rb_ + rb_dbg_ + int64_t(row) * H_; }
 
 const std::vector<float>& GpuGraph::forward_token(int token, int64_t pos) {
-  vk::Recorder rec;
-  if (!rec.begin(cpool_)) {
-    err_ = "recorder begin failed: " + rec.error();
-    return logits_host_;
-  }
-  rec_ = &rec;
+  const ModelConfig& c = *cfg_;
   site_cursor_ = 0;
   building_ = false;
+  // Compute cbs hold a(v) then b(v) per visit in the same flat order the
+  // build walk produces; a cb is closed only before a STAGED visit's b():
+  // a(v) ends with the 32B router-id readback, so after that cb's fence
+  // the host programs visit v's 32 slice copies on the transfer queue —
+  // the SDMA pull then overlaps the next compute cb's host record, and
+  // the trec fence wait before its submit orders the copies ahead of the
+  // stage GEMVs. Dev-resident visits cost no split at all (their GEMVs
+  // read ridx_ on-device in-order, as they always did).
+  vk::Recorder rec, trec;
+  bool rec_open = false, tpend = false, ts_head = false;
   const auto t0 = clk::steady_clock::now();
-  if (ts_en_) {
-    // slot 0 = cb start; slots 1.. = one mark after each recorded op.
-    rec_->reset_query_pool(ts_pool_, 0, ts_cap_);
-    rec_->write_timestamp(ts_pool_, 0);
-    ts_next_ = 1;
-  }
-  emit_token(token, pos);
-  stats.record_ms +=
-      clk::duration<double, std::milli>(clk::steady_clock::now() - t0).count();
-  const auto w0 = clk::steady_clock::now();
-  if (!rec.submit_and_wait(ctx_->compute_queue)) {
-    err_ = "token submit failed: " + rec.error();
+  const double wait0 = stats.wait_ms;
+  bool fail = false;
+  auto begin_cb = [&]() -> bool {
+    if (!rec.begin(cpool_)) {
+      err_ = "recorder begin failed: " + rec.error();
+      return false;
+    }
+    rec_ = &rec;
+    if (ts_en_) {
+      if (!ts_head) {
+        // slot 0 = cb0 start; slots 1.. = one mark after each recorded op.
+        rec_->reset_query_pool(ts_pool_, 0, ts_cap_);
+        rec_->write_timestamp(ts_pool_, 0);
+        ts_next_ = 1;
+        ts_head = true;
+      } else {
+        ts_gap();  // cb-start mark; segment = the inter-submit gap
+      }
+    }
+    rec_open = true;
+    return true;
+  };
+  auto submit_cb = [&]() -> bool {
+    if (tpend) {
+      // the copies this cb consumes must be done before it is submitted
+      if (!trec.wait()) {
+        err_ = "stage copy wait failed";
+        return false;
+      }
+      trec.shutdown();
+      tpend = false;
+    }
+    const auto w0 = clk::steady_clock::now();
+    if (!rec.submit_and_wait(ctx_->compute_queue)) {
+      err_ = "token submit failed: " + rec.error();
+      return false;
+    }
+    stats.wait_ms +=
+        clk::duration<double, std::milli>(clk::steady_clock::now() - w0)
+            .count();
+    stats.submits++;
     rec_ = nullptr;
     rec.shutdown();
-    return logits_host_;
+    rec_open = false;
+    return true;
+  };
+
+  if (begin_cb()) {
+    emit_head(token, pos);
+    for (int s = 0; s < 48 && !fail; s++) {
+      if (s == 6)
+        emit_snap();
+      else if (s == 18)
+        emit_bank(1);
+      else if (s == 30)
+        emit_bank(2);
+      int i, p;
+      visit_ip(c, s, i, p);
+      emit_visit_a(i, p, pos);
+      const Lw& L = lw_[i];
+      if (!L.experts_dev && stage_ok_) {
+        // Staged visit: close the cb right after a(v)'s router-id copy,
+        // read the ids, then record+submit the slice copies on the
+        // transfer queue and open the next compute cb for b(v).
+        if (!submit_cb()) {
+          fail = true;
+          break;
+        }
+        alloc_->invalidate(readback_, VkDeviceSize(rb_ids_) * 4, 32);
+        std::memcpy(stage_ids_, rb_ + rb_ids_, 32);
+        if (!trec.begin(tpool_)) {
+          err_ = "transfer recorder begin failed: " + trec.error();
+          fail = true;
+          break;
+        }
+        rec_ = &trec;
+        ts_off_ = true;  // no timestamps on the transfer queue
+        stage_copies(L);
+        ts_off_ = false;
+        rec_ = nullptr;
+        if (!trec.submit(ctx_->copy_queue())) {
+          err_ = "stage copy submit failed: " + trec.error();
+          fail = true;
+          break;
+        }
+        tpend = true;
+        if (!begin_cb()) {
+          fail = true;
+          break;
+        }
+      }
+      emit_visit_b(i, p);
+    }
+    if (!fail) {
+      emit_fin();
+      fail = !submit_cb();
+    }
+  } else {
+    fail = true;
   }
-  stats.wait_ms +=
-      clk::duration<double, std::milli>(clk::steady_clock::now() - w0).count();
-  stats.submits++;
+  if (tpend) {  // cleanup on the fail path; submit succeeded -> safe wait
+    trec.wait();
+    tpend = false;
+  }
+  trec.shutdown();  // no-op if never began; safe after wait/never-submitted
+  if (rec_open) {
+    rec_ = nullptr;
+    rec.shutdown();
+    rec_open = false;
+  }
+  stats.record_ms +=
+      clk::duration<double, std::milli>(clk::steady_clock::now() - t0)
+          .count() -
+      (stats.wait_ms - wait0);
+  if (fail) return logits_host_;
   if (ts_en_) ts_collect();
-  rec_ = nullptr;
-  rec.shutdown();
   alloc_->invalidate(readback_);
   std::memcpy(logits_host_.data(), rb_, size_t(V_) * 4);
   return logits_host_;
@@ -911,7 +1154,8 @@ bool GpuGraph::init(const ModelConfig& c, const WeightStore& w,
   logits_ = dev(V_ * 4);
   rb_vis_ = V_ + 4 * H;
   rb_dbg_ = rb_vis_ + 96 * H;
-  readback_ = alloc.alloc_host((rb_dbg_ + 16 * H) * 4);
+  rb_ids_ = rb_dbg_ + 16 * H;  // 8 int32 router top-k ids (expert staging)
+  readback_ = alloc.alloc_host((rb_ids_ + 8) * 4);
   if (!readback_.buf) {
     *err = "gpu backend: readback alloc failed: " + alloc.last_error;
     return false;
@@ -949,7 +1193,10 @@ bool GpuGraph::init(const ModelConfig& c, const WeightStore& w,
       load_pipe("log_scale", 1, sizeof(PcTau), p_log_) &&
       load_pipe("embed_norm", 3, sizeof(PcEmb), p_emb_) &&
       load_pipe("matvec_nvfp4_slot", 7, sizeof(sh::PcNvfp4), p_nv4s_) &&
-      load_pipe("matvec_mxfp8_slot", 5, sizeof(sh::PcMxfp8), p_mx8s_);
+      load_pipe("matvec_mxfp8_slot", 5, sizeof(sh::PcMxfp8), p_mx8s_) &&
+      load_pipe("matvec_nvfp4_stage", 7, sizeof(sh::PcNvfp4), p_nv4st_) &&
+      load_pipe("matvec_mxfp8_stage", 5, sizeof(sh::PcMxfp8), p_mx8st_) &&
+      load_pipe("moe_accum_stage", 9, sizeof(sh::PcMoeAccum), p_moest_);
   if (!okp) {
     if (err->empty()) *err = "gpu backend: pipeline load failed: " + err_;
     return false;
@@ -1145,9 +1392,60 @@ bool GpuGraph::init(const ModelConfig& c, const WeightStore& w,
       HB(lname(i, "mlp.experts.w2_weight_outer_scale_denominator"), L.w2o);
     }
     const TensorView* t13 = w.find(lname(i, "mlp.experts.w13_weight"));
+    const TensorView* t13s =
+        w.find(lname(i, "mlp.experts.w13_weight_scale"));
     const TensorView* t2 = w.find(lname(i, "mlp.experts.w2_weight"));
+    const TensorView* t2s = w.find(lname(i, "mlp.experts.w2_weight_scale"));
     if (t13 && t13->nd == 3) L.w13R = t13->shape[1];
     if (t2 && t2->nd == 3) L.w2R = t2->shape[1];
+    // per-expert slice bytes (contiguous [E,R,packedK] => nbytes/E) and the
+    // residency verdict: all four big expert tensors device-local -> mslot
+    // reads them directly; anything host-mirrored -> staged via stg_*_.
+    auto slice_bytes = [](const TensorView* t) -> int64_t {
+      return (t && t->nd == 3 && t->shape[0] > 0)
+                 ? t->nbytes() / t->shape[0]
+                 : int64_t(0);
+    };
+    L.sl13w = slice_bytes(t13);
+    L.sl13s = slice_bytes(t13s);
+    L.sl2w = slice_bytes(t2);
+    L.sl2s = slice_bytes(t2s);
+    L.experts_dev = t13 && t13s && t2 && t2s && devw_.count(t13->data) &&
+                    devw_.count(t13s->data) && devw_.count(t2->data) &&
+                    devw_.count(t2s->data);
+  }
+  // dev-local expert-slice staging (only when some layer is host-resident):
+  // 8 top-k slots x the largest per-expert slice of each tensor.
+  {
+    int64_t m13w = 0, m13s = 0, m2w = 0, m2s = 0;
+    for (int i = 0; i < nl; i++) {
+      const Lw& L = lw_[i];
+      if (L.experts_dev) continue;
+      m13w = std::max(m13w, L.sl13w);
+      m13s = std::max(m13s, L.sl13s);
+      m2w = std::max(m2w, L.sl2w);
+      m2s = std::max(m2s, L.sl2s);
+    }
+    if (m13w > 0) {
+      const std::string e0 = err_;  // staging is optional — restore on fail
+      stg_w13w_ = dev(8 * m13w);
+      stg_w13s_ = dev(8 * m13s);
+      stg_w2w_ = dev(8 * m2w);
+      stg_w2s_ = dev(8 * m2s);
+      stage_ok_ = stg_w13w_.buf && stg_w13s_.buf && stg_w2w_.buf &&
+                  stg_w2s_.buf;
+      if (!stage_ok_) {
+        err_ = e0;
+        // VRAM is full: keep the host-read mslot path for these layers.
+        std::fprintf(stderr,
+                     "gpu backend: expert staging alloc failed (%.0fMB; "
+                     "host-resident path kept): %s\n",
+                     8.0 * (m13w + m13s + m2w + m2s) / (1 << 20),
+                     alloc.last_error.c_str());
+        for (vk::Buffer* b : {&stg_w13w_, &stg_w13s_, &stg_w2w_, &stg_w2s_})
+          if (b->buf) alloc.free(*b);
+      }
+    }
   }
   if (!missing.empty()) {
     *err = "gpu backend: " + std::to_string(missing.size()) +
@@ -1236,14 +1534,16 @@ void GpuGraph::shutdown() {
                         &a_out_, &residual_, &m_in_, &mn_, &moe_out_, &mo_,
                         &ridx_, &rw_, &gate_, &up_, &kvk_, &kvv_, &hist_, &h_,
                         &hfin_, &logits_, &readback_, &embedw_, &embn_,
-                        &normw_, &unembw_, &attnq_, &mlpq_, &msgq_, &outq_};
+                        &normw_, &unembw_, &attnq_, &mlpq_, &msgq_, &outq_,
+                        &stg_w13w_, &stg_w13s_, &stg_w2w_, &stg_w2s_};
   for (auto* b : bufs)
     if (b->buf) alloc_->free(*b);
   Pipe* pipes[] = {&p_rms_, &p_mvf_, &p_mvb_, &p_mv8_, &p_cvs_, &p_cvd_,
                    &p_rel_, &p_sco_, &p_smx_, &p_acc_, &p_ares_, &p_msg_,
                    &p_rtr_, &p_moe_, &p_mred_, &p_moem_, &p_nv4m_, &p_mx8m_,
                    &p_sig_, &p_cap_, &p_add_, &p_l2_,
-                   &p_log_, &p_emb_, &p_nv4s_, &p_mx8s_};
+                   &p_log_, &p_emb_, &p_nv4s_, &p_mx8s_,
+                   &p_nv4st_, &p_mx8st_, &p_moest_};
   for (auto* p : pipes) p->p.shutdown();
   cpool_.shutdown();
   tpool_.shutdown();

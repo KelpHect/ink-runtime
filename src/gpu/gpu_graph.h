@@ -90,7 +90,14 @@ class GpuGraph {
                           *w13o = nullptr, *w2 = nullptr, *w2s = nullptr,
                           *w2a = nullptr, *w2o = nullptr;
     bool full = false, mxfp8 = false;
+    // experts_dev: all four big expert tensors (w13/w13s/w2/w2s) landed
+    // device-local at init -> the mslot shaders read them directly. When
+    // false, decode stages the selected experts' slices into stg_*_ via
+    // vkCmdCopyBuffer (bytes per slot = sl* below) and runs the *_stage
+    // shader variants that index weights by slot instead of expert id.
+    bool experts_dev = false;
     int64_t w13R = 0, w2R = 0;
+    int64_t sl13w = 0, sl13s = 0, sl2w = 0, sl2s = 0;  // bytes per expert
   };
 
   bool load_pipe(const char* name, uint32_t bindings, uint32_t pc_bytes,
@@ -121,7 +128,22 @@ class GpuGraph {
   Bnd kvb(const ink::vk::Buffer& cache, int slot) const;
 
   void emit_token(int token, int64_t pos);
-  void emit_visit(int i, int p, int64_t pos);
+  // Per-visit split (host-resident expert staging): emit_visit_a covers the
+  // visit head through the router plus a 32B copy of ridx_ into the readback
+  // ids region; emit_visit_b is the MoE tail (staged copies, fill, expert
+  // GEMVs, moe_reduce, mlp conv, residual add, dump cp, counters). The flat
+  // op() sequence is a(v) then b(v) per visit in BOTH build and record
+  // walks — record just submits between them so the host can read the
+  // freshly routed expert ids and program visit v's slice copies.
+  void emit_visit_a(int i, int p, int64_t pos);
+  void emit_visit_b(int i, int p);
+  void emit_head(int token, int64_t pos);  // nblock reset + embed
+  void emit_snap();                        // prelude snapshot (pre_* buffers)
+  void emit_bank(int p);                   // pass-p loop-state restore
+  void emit_fin();                         // final attn_res + norm + logits
+  // Record-mode helper: 4 vkCmdCopyBuffer slices per top-k slot for one
+  // host-resident layer (32 copies; no-ops while building_).
+  void stage_copies(const Lw& L);
 
   const ModelConfig* cfg_ = nullptr;
   ink::vk::Context* ctx_ = nullptr;
@@ -148,6 +170,13 @@ class GpuGraph {
   ink::vk::Buffer kvk_, kvv_, hist_;
   ink::vk::Buffer h_, hfin_, logits_;
   ink::vk::Buffer readback_;  // HOST-visible: logits + taps + visit dumps
+  // dev-local expert-slice staging for host-resident layers: 8 slots x the
+  // max per-expert slice of each tensor (w13 weight/scale, w2 weight/scale)
+  ink::vk::Buffer stg_w13w_, stg_w13s_, stg_w2w_, stg_w2s_;
+  int32_t stage_ids_[8] = {};  // last readback of the router's top-k ids
+  // false when the staging alloc failed (VRAM full): host-resident layers
+  // then keep the original mslot host-read path instead of staging.
+  bool stage_ok_ = false;
 
   // weight buffers (globals; per-layer weights live in lw_ as map pointers)
   ink::vk::Buffer embedw_, embn_, normw_, unembw_;
@@ -160,7 +189,8 @@ class GpuGraph {
   Pipe p_rms_, p_mvf_, p_mvb_, p_mv8_, p_cvs_, p_cvd_, p_rel_, p_sco_, p_smx_,
       p_acc_, p_ares_, p_msg_, p_rtr_, p_moe_, p_mred_, p_moem_, p_nv4m_, p_mx8m_,
       p_sig_, p_cap_, p_add_, p_l2_,
-      p_log_, p_emb_, p_nv4s_, p_mx8s_;
+      p_log_, p_emb_, p_nv4s_, p_mx8s_,
+      p_nv4st_, p_mx8st_, p_moest_;  // *_stage variants (slot-indexed stg_*)
 
   std::vector<ink::vk::DescSet> sites_;  // binding stream, built once
   size_t site_cursor_ = 0;
@@ -173,6 +203,7 @@ class GpuGraph {
   // emit) and indexed by slot afterwards. Everything here is inert unless
   // the env var is set: no writes reach the command buffer otherwise.
   void ts_mark(const char* name, const char* tag);
+  void ts_gap();  // cb-start mark in submits > 0; segment = inter-submit gap
   void ts_collect();
   void ts_report() const;
   struct TsSeg {
@@ -182,6 +213,7 @@ class GpuGraph {
     double ms = 0;       // summed GPU time across collected tokens
   };
   bool ts_en_ = false;
+  bool ts_off_ = false;  // suppress marks (copies on the transfer queue)
   VkQueryPool ts_pool_ = VK_NULL_HANDLE;
   uint32_t ts_cap_ = 0;    // pool slots allocated
   uint32_t ts_next_ = 0;   // next query slot during an emit (slot0=cb start)
@@ -203,6 +235,7 @@ class GpuGraph {
   float* rb_ = nullptr;   // mapped readback
   int64_t rb_vis_ = 0;    // float offset of the visit-dump region
   int64_t rb_dbg_ = 0;    // float offset of the visit0 debug region
+  int64_t rb_ids_ = 0;    // float offset of the 8-int32 router-id region
 };
 
 }  // namespace ink::gpu

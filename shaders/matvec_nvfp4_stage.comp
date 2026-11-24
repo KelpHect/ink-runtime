@@ -1,0 +1,79 @@
+#version 460
+
+// matvec_nvfp4_stage.comp — expert GEMV over NVFP4 weights staged in VRAM.
+//
+// Same math as matvec_nvfp4_mslot.comp, but the weight/scale slices were
+// copied per top-k slot into a staging buffer (vkCmdCopyBuffer from the
+// host-resident expert tensors), so the packed-row base is indexed by SLOT
+// instead of expert id:
+//   slot = gl_WorkGroupID.y, e = idx[slot]  (e only for the amax factor)
+//   wr_base = (slot*R + r) * K/8 words    sc_base = (slot*R + r) * K/64 words
+//
+//   acc = sum_k E2M1(W[slot,r,k]) * F8E4M3(S[slot,r,k/16]) * x[k]   (fp32)
+//   o[slot*M + m] = acc * (amax[e] / osd[0])   (M = gl_NumWorkGroups.x)
+//
+// pc.e is unused (kept for struct-layout parity with PcNvfp4).
+// Bindings identical to the mslot variant (AMAX/OSD stay on the tiny host
+// mirrors; IDX still feeds e). Dispatch: grid = {M rows, nslots}.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer WBuf  { uint  w[]; };
+layout(set = 0, binding = 1, std430) readonly buffer SBuf  { uint  s[]; };
+layout(set = 0, binding = 2, std430) readonly buffer ABuf  { float amax[]; };
+layout(set = 0, binding = 3, std430) readonly buffer OBuf  { float osd[]; };
+layout(set = 0, binding = 4, std430) readonly buffer XBuf  { float x[]; };
+layout(set = 0, binding = 5, std430) buffer OBuf2          { float o[]; };
+layout(set = 0, binding = 6, std430) readonly buffer IBuf  { int   idx[]; };
+
+layout(push_constant) uniform Pc {
+    uint  e;           // unused (slot = gl_WorkGroupID.y)
+    uint  R;
+    uint  K;
+    uint  row0;
+    uint  row_stride;
+    float wscale;
+    uint  flags;       // bit0 ACCUMULATE (unused)
+} pc;
+
+shared float red[64];
+
+const float E2M1[16] = float[16](0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                                 -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0);
+
+float f8e4m3_to_f32(uint v) {
+    uint sgn = v >> 7, ex = (v >> 3) & 0xFu, mn = v & 7u;
+    float x = (ex == 0u) ? ldexp(float(mn) / 8.0, -6)
+                         : ldexp(1.0 + float(mn) / 8.0, int(ex) - 7);
+    return sgn != 0u ? -x : x;
+}
+
+void main() {
+    const uint m    = gl_WorkGroupID.x;
+    const uint r    = pc.row0 + m * pc.row_stride;
+    const uint slot = gl_WorkGroupID.y;
+    const uint e    = uint(idx[slot]);
+    const uint tid  = gl_LocalInvocationID.x;
+
+    const uint wr_base = (slot * pc.R + r) * (pc.K >> 3);
+    const uint sc_base = (slot * pc.R + r) * (pc.K >> 6);
+
+    float acc = 0.0;
+    for (uint k = tid; k < pc.K; k += 64u) {
+        uint word = w[wr_base + (k >> 3)];
+        uint bytev = (word >> (((k >> 1) & 3u) * 8u)) & 0xFFu;
+        uint nib = (k & 1u) != 0u ? (bytev >> 4) : (bytev & 0xFu);
+        uint sw = s[sc_base + (k >> 6)];
+        float bs = f8e4m3_to_f32((sw >> (((k >> 4) & 3u) * 8u)) & 0xFFu);
+        acc += E2M1[nib] * bs * x[k];
+    }
+
+    red[tid] = acc;
+    barrier();
+    for (uint st = 32u; st > 0u; st >>= 1) {
+        if (tid < st) red[tid] += red[tid + st];
+        barrier();
+    }
+    if (tid == 0u)
+        o[slot * gl_NumWorkGroups.x + m] = red[0] * (amax[e] / osd[0]);
+}
