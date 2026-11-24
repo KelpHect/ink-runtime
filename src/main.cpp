@@ -1,6 +1,10 @@
 #include "io/config.h"
 #include "io/safetensors.h"
+#include "model/backend.h"
 #include "model/graph.h"
+#ifdef INK_WITH_VULKAN
+#include "gpu/vk_backend.h"
+#endif
 
 #include <cmath>
 #include <cstdio>
@@ -64,12 +68,20 @@ int main(int argc, char** argv) {
   if (argc < 2) {
     std::fprintf(stderr,
                  "usage: ink <model_dir> [--prompt \"...\"] [--tokens N] "
-                 "[--ctx N] [--token-ids a,b,c]\n");
+                 "[--ctx N] [--token-ids a,b,c] [--dump dir] "
+                 "[--backend cpu|vk] [--shader-dir dir]\n");
     return 1;
   }
   std::string dir = argv[1];
   std::string prompt;
   std::string dump_dir;
+  std::string backend = "cpu";
+  std::string shader_dir =
+#ifdef INK_SHADER_DIR
+      INK_SHADER_DIR;
+#else
+      "shaders";
+#endif
   int gen_tokens = 8;
   int ctx = 4096;
   std::vector<int> ids;
@@ -83,6 +95,9 @@ int main(int argc, char** argv) {
     };
     if (!std::strcmp(argv[i], "--prompt")) prompt = need("--prompt");
     else if (!std::strcmp(argv[i], "--dump")) dump_dir = need("--dump");
+    else if (!std::strcmp(argv[i], "--backend")) backend = need("--backend");
+    else if (!std::strcmp(argv[i], "--shader-dir"))
+      shader_dir = need("--shader-dir");
     else if (!std::strcmp(argv[i], "--tokens")) gen_tokens = atoi(need("--tokens"));
     else if (!std::strcmp(argv[i], "--ctx")) ctx = atoi(need("--ctx"));
     else if (!std::strcmp(argv[i], "--token-ids")) {
@@ -138,6 +153,24 @@ int main(int argc, char** argv) {
     return 1;
   }
   std::printf("graph: all weights resolved\n");
+
+#ifdef INK_WITH_VULKAN
+  ink::gpu::VkBackend vk_backend;
+  if (backend == "vk") {
+    if (!vk_backend.init(shader_dir, err)) {
+      std::fprintf(stderr, "vk backend: %s\n", err.c_str());
+      return 1;
+    }
+    ops::backend_slot() = &vk_backend;
+    std::printf("backend: vk (shader-dir %s)\n", shader_dir.c_str());
+  } else
+#endif
+  {
+    if (backend != "cpu")
+      std::fprintf(stderr, "backend '%s' unknown, using cpu\n",
+                   backend.c_str());
+    std::printf("backend: cpu\n");
+  }
 
   int cur_step = -1;  // visit-hook tag; -1 = don't write per-visit files
   if (!dump_dir.empty()) {

@@ -54,7 +54,9 @@ if(INK_WITH_VULKAN)
     src/vk/vk.cpp
     src/vk/mem.cpp
     src/vk/cmd.cpp
-    src/vk/pipe.cpp)
+    src/vk/pipe.cpp
+    src/gpu/vk_backend.cpp)
+  target_include_directories(inkcore PUBLIC ${CMAKE_SOURCE_DIR}/shaders)
 
   # Compile shaders/*.comp -> ${CMAKE_BINARY_DIR}/shaders/<name>.spv.
   # shaders/ may not exist yet; the glob tolerates empty.
@@ -82,6 +84,9 @@ endif()
 
 add_executable(ink src/main.cpp)
 target_link_libraries(ink PRIVATE inkcore)
+if(INK_WITH_VULKAN)
+  target_compile_definitions(ink PRIVATE INK_SHADER_DIR="${CMAKE_BINARY_DIR}/shaders")
+endif()
 if(MSVC)
   target_compile_options(ink PRIVATE /W4 /permissive- /Zc:__cplusplus /utf-8)
   target_compile_definitions(ink PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)

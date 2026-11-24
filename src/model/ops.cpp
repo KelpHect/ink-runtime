@@ -1,5 +1,7 @@
 #include "ops.h"
 
+#include "backend.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -7,6 +9,11 @@
 #include <stdexcept>
 
 namespace ink::ops {
+
+Backend*& backend_slot() {
+  static Backend* b = nullptr;
+  return b;
+}
 
 float sigmoid(float x) { return 1.f / (1.f + std::exp(-x)); }
 float softcap(float x, float cap) { return cap * std::tanh(x / cap); }
@@ -52,6 +59,7 @@ float dot(const float* a, const float* b, int64_t n) {
 void matvec(const TensorView& W, const float* x, float* out, int64_t M,
             int64_t K) {
   // M <= W.shape[0] allowed: computes the first M rows (unpad slice).
+  if (backend_slot() && backend_slot()->matvec(W, x, out, M, K)) return;
   if (W.shape[0] < M || W.shape[1] != K)
     throw std::runtime_error("matvec shape mismatch");
   for (int64_t m = 0; m < M; m++) {
@@ -342,6 +350,12 @@ void router_topk(const TensorView& gate_w, const TensorView& gate_b,
 static float expert_dot(const TensorView& W, const TensorView& S,
                         const TensorView& amax, const TensorView& osd,
                         bool mxfp8, int e, int64_t r, const float* x, int64_t K) {
+  float gpu_out = 0.f;
+  if (backend_slot() &&
+      backend_slot()->expert_dot(W, S, amax, osd, mxfp8, e, r, x, K,
+                                 &gpu_out)) {
+    return gpu_out;
+  }
   const std::byte* wrow = W.ptr(e, r, 0);
   const std::byte* srow = S.ptr(e, r, 0);
   float acc = 0.f;
@@ -377,6 +391,12 @@ void moe_forward(const ModelConfig& c, const MlpW& m, const float* x,
   std::fill(out, out + D, 0.f);
   for (int i = 0; i < k; i++) {
     int e = idx[i];
+    if (backend_slot() &&
+        backend_slot()->expert_ffn(E.w13, E.w13s, E.w13amax, E.w13osd, E.w2,
+                                   E.w2s, E.w2amax, E.w2osd, E.mxfp8, e, x, D,
+                                   I, float(c.mlp_gate_softcap),
+                                   float(c.mlp_up_softcap), w[i], out))
+      continue;
     // w13 out-rows are interleaved (gate,up) pairs along dim 1: row 2m is
     // gate_m, row 2m+1 is up_m (de-interleave = reshape [1152,2].T)
     for (int mm = 0; mm < I; mm++) {

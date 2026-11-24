@@ -32,3 +32,5 @@ nul
 # OS
 Thumbs.db
 .DS_Store
+testdata/ink_vk/
+testdata/*.log
