@@ -2,6 +2,8 @@
 Inkling-2-Mini/
 data/
 testdata/golden/*.npy
+testdata/golden/visits/
+testdata/ink/
 *.safetensors
 *.gguf
 
