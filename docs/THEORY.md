@@ -44,11 +44,14 @@ No math-rate fuse on AMD. Gains are platform/software:
 
 | Knob | Effect | Cost |
 |---|---|---|
+| **PCIe Gen5 x16 — VERIFIED on this box** (PnP: CurrentLinkSpeed=5, Width=16) | max H2D ~50–55 GB/s available | done |
+| **ReBAR — VERIFIED ON** (heap1 = 15.92GiB DEVICE_LOCAL+HOST_VISIBLE+COHERENT) | zero-copy CPU→VRAM staging works | done |
+| **Dedicated TRANSFER queue — VERIFIED** (family2, SDMA) + 8 compute queues | async H2D/compute overlap on Win prop driver | done |
+| `VK_EXT_external_memory_host` present | RAM-resident experts readable by shaders over PCIe | done |
 | Undervolt −100…−120 mV | +8–9% when power-limited (junction ~104°C is the wall) | stability test required |
 | Power limit +10% (MCT → 340W) | stacks with UV | thermal |
 | Memory OC | **negative** — GDDR6 link retry makes it *slower* (−6.6% measured); leave stock | — |
 | PCIe ASPM off | +10.8% decode (dense), ~0 MoE | free |
-| ReBAR + Gen5 x16 verified | mandatory (4.3× prefill cliff if off) | BIOS |
 | perf-level `auto` (not peak/high) | peak = −23% on mem-bound; high = −4.3% | free |
 | RAS/ECC off if enabled | ~+9% BW on R9700 sibling; verify on consumer | free if present |
 | Keep GPU saturated (fused kernels, prerecorded cmd bufs) | avoids mclk 96↔1258 bounce | design |
