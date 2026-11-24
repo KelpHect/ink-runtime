@@ -18,10 +18,10 @@ Ceilings/budgets: `docs/THEORY.md`. Model facts: `research/00-model-facts.md`.
 
 ## Phases
 
-### P0 — ground truth (days)
-- C++ toolchain; safetensors mmap parser (~200 LOC); config/schema dump. Model questions resolved by `research/07` (loop = block-sequential passes 6..17 ×3; **KV is per-pass** → 48 cache sets; router renormalizes sigmoid scores over top-8 then ×8 → k1/k2 knob valid; MTP = anchor+7-mask block draft with GRU markov chain, `rnn_proj` input = [state|markov_w1(prev)|hidden|f_rnn]=5120; no RoPE — content-conditioned rel-bias d_rel=16 extent 1024; attn_res = learned softmax reads over block-boundary snapshots replacing the residual stream). Remaining to verify in P0 only at the bit level: dynamic-conv tap semantics, sink-column trick (subtract-t variant), w13 gate/up interleave.
-- Hardware probes above; undervolt profile (−100mV start) + ASPM off + ReBAR verified; microbench: per-instruction WMMA rates, H2D pinned bandwidth, DDR5, NVMe 2-thread QD8.
-- Reference correctness harness: run HF `inkling2_loop` (eager) on a small prompt → dump per-layer hidden states + logits → our golden outputs. Bit-compare standard for every kernel change.
+### P0 — ground truth (days) — **DONE 2026-11-24**
+- C++ toolchain (MSVC 2022 + CMake 4.4.4 + Vulkan SDK 1.4.363 — `docs/toolchain-status.md`); safetensors mmap parser + config schema in `src/io/`; fp32 CPU reference (`src/model/`) runs the full 48-visit pipeline.
+- Hardware probes done (`tools/vkprobe.c`, `vkbench.c`): FP8-E4M3 coopmat on Adrenalin verified, 18× 16×16×16 configs; SDMA copy = 32.5 GB/s (DDR4-bound); ReBAR + Gen5 x16 confirmed.
+- **Golden gate GREEN**: `tools/dump_golden.py` (HF ref, custom offload hooks — accelerate's own offload segfaults), `tools/compare_golden.py`, `tools/dump_visits.py` + `compare_visits.py` for per-visit bisection. All 48 visits cos ≥ 0.998, all 8 argmax match (bf16-vs-fp32 floor). Resolved bit-level: dynamic-conv taps lag=backward-distance (correct), **static conv1d taps were REVERSED — fixed** (w[..,3]=current), w13 interleave = pairs on disk (correct), sink-column + router renorm + message bank (2-src: last loop-boundary block + prev final) all verified correct.
 
 ### P1 — vertical slice decode (weeks 1–3): one token out, correctness first
 - Vulkan backend skeleton (volk, device probe, slab allocator, cmd-pool, timeline sems).
