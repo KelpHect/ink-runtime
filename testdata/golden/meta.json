@@ -42,177 +42,177 @@
     ]
   },
   "generated_ids": [
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0
+    200001,
+    200008,
+    371,
+    150409,
+    171960,
+    149878,
+    150744,
+    151231
   ],
-  "generated_text": "!!!!!!!!",
+  "generated_text": "<|message_model|><|content_thinking|>The user asks a simple fact",
   "eos_token_id": 200006,
   "steps": [
     {
       "step": 0,
       "input_len": 25,
-      "argmax": 0,
+      "argmax": 200001,
       "top5_ids": [
-        3,
-        4,
-        1,
-        0,
-        2
+        200001,
+        200008,
+        2986,
+        9850,
+        109631
       ],
       "top5_values": [
-        NaN,
-        NaN,
-        NaN,
-        NaN,
-        NaN
+        26.719120025634766,
+        3.6844308376312256,
+        3.53044056892395,
+        3.2991034984588623,
+        2.4787113666534424
       ],
-      "seconds": 2.3
+      "seconds": 62.87
     },
     {
       "step": 1,
       "input_len": 1,
-      "argmax": 0,
+      "argmax": 200008,
       "top5_ids": [
-        3,
-        4,
-        1,
-        0,
-        2
+        200008,
+        200004,
+        200049,
+        107184,
+        40936
       ],
       "top5_values": [
-        NaN,
-        NaN,
-        NaN,
-        NaN,
-        NaN
+        26.61419105529785,
+        13.517134666442871,
+        2.4942290782928467,
+        1.9581495523452759,
+        1.6234126091003418
       ],
-      "seconds": 0.38
+      "seconds": 59.66
     },
     {
       "step": 2,
       "input_len": 1,
-      "argmax": 0,
+      "argmax": 371,
       "top5_ids": [
-        3,
-        4,
-        1,
-        0,
-        2
+        371,
+        32153,
+        1003,
+        3215,
+        2487
       ],
       "top5_values": [
-        NaN,
-        NaN,
-        NaN,
-        NaN,
-        NaN
+        29.730222702026367,
+        19.85102653503418,
+        19.709714889526367,
+        18.753013610839844,
+        17.97154998779297
       ],
-      "seconds": 0.34
+      "seconds": 47.09
     },
     {
       "step": 3,
       "input_len": 1,
-      "argmax": 0,
+      "argmax": 150409,
       "top5_ids": [
-        3,
-        4,
-        1,
-        0,
-        2
+        150409,
+        150377,
+        152103,
+        151451,
+        179177
       ],
       "top5_values": [
-        NaN,
-        NaN,
-        NaN,
-        NaN,
-        NaN
+        29.422279357910156,
+        19.494823455810547,
+        14.108094215393066,
+        12.295144081115723,
+        11.398468971252441
       ],
-      "seconds": 0.36
+      "seconds": 58.67
     },
     {
       "step": 4,
       "input_len": 1,
-      "argmax": 0,
+      "argmax": 171960,
       "top5_ids": [
-        3,
-        4,
-        1,
-        0,
-        2
+        171960,
+        149884,
+        152473,
+        159306,
+        153647
       ],
       "top5_values": [
-        NaN,
-        NaN,
-        NaN,
-        NaN,
-        NaN
+        29.222776412963867,
+        25.37790870666504,
+        23.74012565612793,
+        21.906152725219727,
+        16.376537322998047
       ],
-      "seconds": 0.34
+      "seconds": 61.18
     },
     {
       "step": 5,
       "input_len": 1,
-      "argmax": 0,
+      "argmax": 149878,
       "top5_ids": [
-        3,
-        4,
-        1,
-        0,
-        2
+        149878,
+        25,
+        149887,
+        196980,
+        149876
       ],
       "top5_values": [
-        NaN,
-        NaN,
-        NaN,
-        NaN,
-        NaN
+        28.989253997802734,
+        27.998783111572266,
+        27.796045303344727,
+        24.10417366027832,
+        23.64606285095215
       ],
-      "seconds": 0.32
+      "seconds": 61.37
     },
     {
       "step": 6,
       "input_len": 1,
-      "argmax": 0,
+      "argmax": 150744,
       "top5_ids": [
-        3,
-        4,
-        1,
-        0,
-        2
+        150744,
+        151231,
+        179177,
+        150399,
+        150990
       ],
       "top5_values": [
-        NaN,
-        NaN,
-        NaN,
-        NaN,
-        NaN
+        27.72417449951172,
+        24.36471176147461,
+        21.366477966308594,
+        18.90453338623047,
+        18.445207595825195
       ],
-      "seconds": 0.38
+      "seconds": 59.64
     },
     {
       "step": 7,
       "input_len": 1,
-      "argmax": 0,
+      "argmax": 151231,
       "top5_ids": [
-        3,
-        4,
-        1,
-        0,
-        2
+        151231,
+        151426,
+        220,
+        150377,
+        182138
       ],
       "top5_values": [
-        NaN,
-        NaN,
-        NaN,
-        NaN,
-        NaN
+        28.455150604248047,
+        22.193490982055664,
+        19.349609375,
+        18.979698181152344,
+        17.565834045410156
       ],
-      "seconds": 0.31
+      "seconds": 59.96
     }
   ],
   "hidden_tap_spec": {
@@ -268,7 +268,7 @@
     "hidden_final_step7.npy"
   ],
   "notes": [
-    "experts dequantized NVFP4/MXFP8->bf16 at load by HF Inkling2LoopDequantizeExperts; expert params offloaded to data/hf_offload/ during inference (accelerate disk offload)",
+    "experts dequantized NVFP4/MXFP8->bf16 at load by HF Inkling2LoopDequantizeExperts; expert params written to data/hf_offload/*.safetensors and streamed in/out per forward call by custom hooks installed in dump_golden.py (accelerate's own disk-offload hooks crash in this version - see script comments)",
     "vision tower and mtp.safetensors not loaded (text-only harness)"
   ]
 }

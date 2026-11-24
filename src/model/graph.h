@@ -4,6 +4,7 @@
 #include "io/safetensors.h"
 #include "ops.h"
 
+#include <functional>
 #include <vector>
 
 namespace ink {
@@ -63,6 +64,11 @@ class Graph {
   const std::vector<float>& forward_token(int token, int64_t pos);
   const RunState& state() const { return s_; }
   const ModelW& weights() const { return w_; }
+
+  // Golden-gate instrumentation: called (phase 0 = layer input partial,
+  // phase 1 = post-visit partial) at every visit when set.
+  std::function<void(int vidx, int phase, const std::vector<float>&)>
+      visit_hook;
 
  private:
   void visit(int i, int p, int64_t pos);

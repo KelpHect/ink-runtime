@@ -178,6 +178,7 @@ void Graph::visit(int i, int p, int64_t pos) {
   if (vidx == 5) s_.taps[0] = s_.partial;
   else if (vidx == 23) s_.taps[1] = s_.partial;
   else if (vidx == 41) s_.taps[2] = s_.partial;
+  if (visit_hook) visit_hook(vidx, 0, s_.partial);
 
   // --- messages from previous pass (loop layers, pass >= 1) ---
   const float* msgs = nullptr;
@@ -266,6 +267,7 @@ void Graph::visit(int i, int p, int64_t pos) {
   ops::sconv4_static(s_.moe_out.data(), L.mlp_sconv, cache.conv[3],
                      s_.mo.data());
   for (int d = 0; d < H; d++) s_.partial[d] = s_.residual[d] + s_.mo[d];
+  if (visit_hook) visit_hook(vidx, 1, s_.partial);
 }
 
 const std::vector<float>& Graph::forward_token(int token, int64_t pos) {

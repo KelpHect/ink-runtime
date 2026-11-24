@@ -11,6 +11,31 @@
 
 using namespace ink;
 
+// Write a flat f32 array for the golden-gate comparator (.bin, no header).
+static bool dump_f32(const std::string& dir, const char* name, int step,
+                     const float* p, size_t n) {
+  char path[512];
+  std::snprintf(path, sizeof(path), "%s\\%s_step%d.bin", dir.c_str(), name,
+                step);
+  FILE* f = std::fopen(path, "wb");
+  if (!f) return false;
+  size_t w = std::fwrite(p, sizeof(float), n, f);
+  std::fclose(f);
+  return w == n;
+}
+
+// Golden filenames mirror tools/dump_golden.py; compare last position only.
+static void dump_step(const std::string& dir, const RunState& s, int step) {
+  static const char* tapn[3] = {"hidden_visit5", "hidden_visit23",
+                                "hidden_visit41"};
+  for (int i = 0; i < 3; i++)
+    if (!s.taps[i].empty())
+      dump_f32(dir, tapn[i], step, s.taps[i].data(), s.taps[i].size());
+  if (!s.h_fin.empty())
+    dump_f32(dir, "hidden_final", step, s.h_fin.data(), s.h_fin.size());
+  dump_f32(dir, "logits", step, s.logits.data(), s.logits.size());
+}
+
 static void print_census(const WeightStore& store) {
   // expectations from research/00 (verified census 2026-11-24)
   struct {
@@ -44,6 +69,7 @@ int main(int argc, char** argv) {
   }
   std::string dir = argv[1];
   std::string prompt;
+  std::string dump_dir;
   int gen_tokens = 8;
   int ctx = 4096;
   std::vector<int> ids;
@@ -56,6 +82,7 @@ int main(int argc, char** argv) {
       return argv[++i];
     };
     if (!std::strcmp(argv[i], "--prompt")) prompt = need("--prompt");
+    else if (!std::strcmp(argv[i], "--dump")) dump_dir = need("--dump");
     else if (!std::strcmp(argv[i], "--tokens")) gen_tokens = atoi(need("--tokens"));
     else if (!std::strcmp(argv[i], "--ctx")) ctx = atoi(need("--ctx"));
     else if (!std::strcmp(argv[i], "--token-ids")) {
@@ -112,26 +139,43 @@ int main(int argc, char** argv) {
   }
   std::printf("graph: all weights resolved\n");
 
+  int cur_step = -1;  // visit-hook tag; -1 = don't write per-visit files
+  if (!dump_dir.empty()) {
+    g.visit_hook = [&](int vidx, int phase, const std::vector<float>& h) {
+      if (cur_step < 0) return;
+      char name[64];
+      std::snprintf(name, sizeof(name), "visit%02d_%s", vidx,
+                    phase ? "out" : "in");
+      dump_f32(dump_dir, name, cur_step, h.data(), h.size());
+    };
+  }
+
   if (!prompt.empty())
     std::printf("note: BPE tokenizer not wired in this milestone; ignoring "
                 "--prompt, use --token-ids a,b,c\n");
   if (ids.empty()) ids = {200028};  // <|begin_of_text|>
 
   int64_t pos = 0;
+  size_t ip = 0;
   for (int t : ids) {
+    if (++ip == ids.size()) cur_step = 0;  // tag last prompt token as step0
     g.forward_token(t, pos++);
     int am = ops::argmax(g.state().logits.data(),
                          int(g.state().logits.size()));
     std::printf("pos %lld prompt tok %d -> argmax %d\n", (long long)(pos - 1),
                 t, am);
+    if (!dump_dir.empty() && ip == ids.size())
+      dump_step(dump_dir, g.state(), 0);  // step0 = last prompt position
   }
   int cur = ops::argmax(g.state().logits.data(),
                         int(g.state().logits.size()));
   for (int t = 0; t < gen_tokens; t++) {
+    cur_step = t + 1;
     const std::vector<float>& logits = g.forward_token(cur, pos++);
     int am = ops::argmax(logits.data(), int(logits.size()));
     float lp = logits[am];
     std::printf("gen %d: token %d (logit %.3f)\n", t, am, lp);
+    if (!dump_dir.empty()) dump_step(dump_dir, g.state(), t + 1);
     if (am == cfg.eos_token_id) break;
     cur = am;
   }

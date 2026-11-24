@@ -104,19 +104,29 @@ def main():
     log(f"text config: {type(text_cfg).__name__}, layers={text_cfg.num_hidden_layers}, "
         f"visits={text_cfg.total_num_hidden_layers}")
 
-    # device_map notes:
-    #  * Parameter-level keys do NOT work: accelerate's dispatch_model matches
-    #    keys to *submodules* only, silently leaving offloaded params on meta
-    #    (F.linear on a meta weight then returns garbage without erroring).
-    #  * A root '' -> 'cpu' entry also does NOT work: it attaches a
-    #    place_submodules hook at the root that eagerly moves the offloaded
-    #    (meta) expert params to cpu and crashes.
-    #  * 'auto' emits leaf-module-level keys only (decoder layers are
-    #    _no_split_modules, so each ~2 GB layer maps atomically); modules that
-    #    do not fit max_memory land on 'disk' and page in per forward call.
-    device_map = "auto"
-    max_memory = {"cpu": "6GiB"}
-    log("device_map: auto, max_memory cpu=6GiB (whole decoder layers -> disk)")
+    # Device map / offload design (worked out against accelerate's quirks):
+    #  * Parameter-level 'disk' keys: during load the weight is written to
+    #    OFFLOAD_DIR/<name>.safetensors and the param stays meta. accelerate's
+    #    dispatch_model only matches *module* names, so these keys attach NO
+    #    hooks - the params remain meta and nothing auto-loads them. That is
+    #    exactly what we want: we install our own streaming hooks below.
+    #    (Module-level 'disk' keys or ''->cpu DO attach accelerate hooks, which
+    #    either crash at init moving meta params, or segfault inside
+    #    OffloadedWeightsLoader reading the safetensors mmap.)
+    from accelerate import init_empty_weights
+
+    with init_empty_weights():
+        skeleton = Inkling2LoopForCausalLM(text_cfg)
+    device_map = {}
+    n_disk = 0
+    for name, _ in skeleton.named_parameters():
+        dev = "disk" if ".mlp.experts." in name else "cpu"
+        device_map[name] = dev
+        n_disk += dev == "disk"
+    for name, _ in skeleton.named_buffers():
+        device_map[name] = "cpu"
+    del skeleton
+    log(f"device_map: {len(device_map)} entries, {n_disk} expert params on disk")
 
     # ------------------------------------------------------------------
     # Load (experts dequantize bf16 -> written to OFFLOAD_DIR during load)
@@ -127,7 +137,6 @@ def main():
         config=text_cfg,
         dtype=torch.bfloat16,
         device_map=device_map,
-        max_memory=max_memory,
         offload_folder=OFFLOAD_DIR,
         attn_implementation="eager",
     )
@@ -138,6 +147,55 @@ def main():
     text_model = model.model  # Inkling2LoopTextModel
     layers = text_model.layers
     assert len(layers) == text_cfg.num_hidden_layers
+
+    # ------------------------------------------------------------------
+    # Expert streaming hooks. Each mlp.experts' gate_up_proj/down_proj was
+    # written to OFFLOAD_DIR/<full param name>.safetensors during load and
+    # the param left on meta. Before every forward we materialize the two
+    # params from disk (clone INSIDE the safe_open context - safetensors
+    # tensors may view the mmap which invalidates after close); after the
+    # forward we put the params back on meta to release the ~2 GB.
+    # ------------------------------------------------------------------
+    from safetensors import safe_open
+
+    EXPERT_PARAMS = ("gate_up_proj", "down_proj")
+    stream_stats = {"loads": 0}
+
+    def make_streamer(module_name):
+        paths = {
+            p: os.path.join(OFFLOAD_DIR, f"{module_name}.{p}.safetensors")
+            for p in EXPERT_PARAMS
+        }
+        for pth in paths.values():
+            assert os.path.isfile(pth), f"missing offload file {pth}"
+
+        def pre_hook(module, args):
+            for pname, path in paths.items():
+                param = module._parameters.get(pname)
+                if param is not None and param.is_meta:
+                    with safe_open(path, framework="pt") as f:
+                        tensor = f.get_tensor(f"{module_name}.{pname}").clone()
+                    module._parameters[pname] = torch.nn.Parameter(
+                        tensor, requires_grad=False
+                    )
+                    stream_stats["loads"] += 1
+
+        def post_hook(module, args, output):
+            for pname in EXPERT_PARAMS:
+                module._parameters[pname] = torch.nn.Parameter(
+                    torch.empty(0, device="meta"), requires_grad=False
+                )
+
+        return pre_hook, post_hook
+
+    n_stream = 0
+    for i, lyr in enumerate(layers):
+        mod_name = f"model.layers.{i}.mlp.experts"
+        pre, post = make_streamer(mod_name)
+        lyr.mlp.experts.register_forward_pre_hook(pre)
+        lyr.mlp.experts.register_forward_hook(post)
+        n_stream += 1
+    log(f"installed streaming hooks on {n_stream} expert modules")
 
     # ------------------------------------------------------------------
     # Tap hooks: virtual-visit counter + layer-input capture + final norm
@@ -271,14 +329,18 @@ def main():
         "files": meta_files,
         "notes": [
             "experts dequantized NVFP4/MXFP8->bf16 at load by HF "
-            "Inkling2LoopDequantizeExperts; expert params offloaded to "
-            "data/hf_offload/ during inference (accelerate disk offload)",
+            "Inkling2LoopDequantizeExperts; expert params written to "
+            "data/hf_offload/*.safetensors and streamed in/out per forward "
+            "call by custom hooks installed in dump_golden.py (accelerate's "
+            "own disk-offload hooks crash in this version - see script "
+            "comments)",
             "vision tower and mtp.safetensors not loaded (text-only harness)",
         ],
     }
     with open(os.path.join(OUT_DIR, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
-    log(f"done. total step time {sum(step_times):.1f}s -> {OUT_DIR}")
+    log(f"done. total step time {sum(step_times):.1f}s, "
+        f"expert param loads: {stream_stats['loads']} -> {OUT_DIR}")
 
 
 if __name__ == "__main__":
