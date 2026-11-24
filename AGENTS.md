@@ -38,3 +38,17 @@ Expert pack: `tools/make_expertpack.py` → `data/expertpack.v1.bin`.
 - Weights/venv/vendor/data dirs are git-ignored; never commit binaries.
 - `vendor/Strata/` is Apache-licensed reference code — study, don't copy wholesale.
 - Git: commit only files you changed; identity is the repo's configured user.
+
+## Vulkan backend gotchas (learned the hard way)
+- `ink::vk::Buffer` is a dedicated VkBuffer already bound at its slab offset —
+  descriptor ranges are BUFFER-RELATIVE: write_storage(buf, 0, size). Passing
+  the slab offset shifts the range past the buffer end -> OOB shader reads ->
+  page fault -> Adrenalin TDR / VK_ERROR_DEVICE_LOST. (2026-11-24 incident)
+- Descriptor contents are sampled at EXECUTE time: dispatches in the same
+  command buffer needing different bindings must use separate DescSets.
+- Every recorded copy/dispatch sees buffer contents at execute time: never
+  record a copy then reuse the staging region inside the same cb.
+- Expert tensors live in HOST_VISIBLE RAM buffers (host_cache_/host_buf) —
+  GPU streams only selected rows over PCIe; do NOT upload experts to VRAM.
+- `ink --backend vk --dump dir` + tools/compare_golden.py is the correctness
+  gate (argmax must match 8/8; hidden cos >= 0.98).
