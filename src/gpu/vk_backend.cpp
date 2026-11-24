@@ -7,7 +7,16 @@
 #include "bindings.h"  // shaders/ push-constant contracts
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
+
+namespace {
+double ms_since(std::chrono::steady_clock::time_point t0) {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now() - t0)
+      .count();
+}
+}  // namespace
 
 namespace ink::gpu {
 namespace sh = ink::shaders;
@@ -89,6 +98,8 @@ void VkBackend::shutdown() {
   if (ctx_.device) vkDeviceWaitIdle(ctx_.device);
   for (auto& kv : cache_) alloc_.free(kv.second.b);
   cache_.clear();
+  for (auto& kv : host_cache_) alloc_.free(kv.second);
+  host_cache_.clear();
   cache_bytes_ = 0;
   for (ink::vk::Buffer* b : {&staging_, &xbuf_, &obuf_, &gbuf_, &ubuf_, &eobuf_,
                              &dummy4_})
@@ -131,39 +142,72 @@ void VkBackend::evict_for(VkDeviceSize need) {
 }
 
 const ink::vk::Buffer* VkBackend::upload(const TensorView& t) {
-  if (!t.data || !contiguous(t)) return nullptr;
+  if (!t.data || !contiguous(t)) {
+    stats.upf_noncontig++;
+    return nullptr;
+  }
   VkDeviceSize bytes = VkDeviceSize(t.nbytes());
   auto it = cache_.find(t.data);
   if (it != cache_.end()) {
     it->second.tick = ++tick_;
     return &it->second.b;
   }
-  if (bytes > cache_cap_) return nullptr;  // will never fit; CPU fallback
+  if (bytes > cache_cap_) {
+    stats.upf_toobig++;
+    return nullptr;
+  }
   evict_for(bytes);
+  auto t0 = std::chrono::steady_clock::now();
   ink::vk::Buffer dev = alloc_.alloc_device_local(bytes);
-  if (!alloc_.ok(dev)) return nullptr;
+  if (!alloc_.ok(dev)) {
+    stats.upf_alloc++;
+    return nullptr;
+  }
 
-  // Chunked staging upload: memcpy RAM->staging (full speed), then one
-  // recorded copy per chunk submitted once on the SDMA queue.
+  // Whole-tensor staging (staging_ grows to the largest upload): every
+  // recorded copy reads staging data that must be final at execute time,
+  // so chunking a single submission would smear the last chunk everywhere.
+  if (!grow_host(staging_, bytes)) {
+    stats.upf_alloc++;
+    alloc_.free(dev);
+    return nullptr;
+  }
   ink::vk::Recorder rec;
   if (!rec.begin(tpool_)) {
+    stats.upf_rec++;
+    stats.upf_begin++;
+    if (stats.first_err.empty())
+      stats.first_err = "upload begin: " + rec.error();
     alloc_.free(dev);
     return nullptr;
   }
   const std::byte* src = t.data;
   char* stg = static_cast<char*>(alloc_.mapped(staging_));
-  VkDeviceSize chunk = staging_.size;
-  for (VkDeviceSize off = 0; off < bytes; off += chunk) {
-    VkDeviceSize n = std::min(chunk, bytes - off);
-    std::memcpy(stg, src + off, size_t(n));
-    rec.copy_buffer(staging_.buf, dev.buf, n, 0, off);
-  }
+  std::memcpy(stg, src, size_t(bytes));
+  rec.copy_buffer(staging_.buf, dev.buf, bytes, 0, 0);
   if (!rec.end_and_submit(ctx_.copy_queue())) {
+    stats.upf_rec++;
+    stats.upf_submit++;
+    if (stats.first_err.empty()) {
+      char buf[160];
+      std::snprintf(buf, sizeof(buf),
+                    "upload submit: %s (tensor #%llu bytes=%.1fMB nd=%d "
+                    "shape[%lld,%lld,%lld] dtype=%d)",
+                    rec.error().c_str(),
+                    (unsigned long long)(stats.uploads + 1), bytes / 1e6, t.nd,
+                    (long long)t.shape[0], (long long)t.shape[1],
+                    (long long)t.shape[2], int(t.dtype));
+      stats.first_err = buf;
+    }
     rec.shutdown();
     alloc_.free(dev);
     return nullptr;
   }
   rec.shutdown();
+  stats.uploads++;
+  stats.upload_bytes += bytes;
+  stats.upload_ms += ms_since(t0);
+  stats.submits++;
   Cached c{dev, ++tick_};
   auto [ins, _] = cache_.emplace(t.data, c);
   (void)_;
@@ -173,37 +217,75 @@ const ink::vk::Buffer* VkBackend::upload(const TensorView& t) {
 
 bool VkBackend::write_n(const ink::vk::DescSet& ds,
                         const ink::vk::Buffer* const* bufs, uint32_t n) {
+  // Each Buffer is a dedicated VkBuffer already bound at its slab offset —
+  // the descriptor range is buffer-relative: offset 0, range = size.
   for (uint32_t i = 0; i < n; i++)
-    if (!ink::vk::write_storage(ctx_, ds, i, bufs[i]->buf, bufs[i]->offset,
-                                bufs[i]->size, err_))
+    if (!ink::vk::write_storage(ctx_, ds, i, bufs[i]->buf, 0, bufs[i]->size,
+                                err_))
       return false;
   return true;
 }
 
+const ink::vk::Buffer* VkBackend::host_buf(const TensorView& t) {
+  if (!t.data || !contiguous(t)) {
+    stats.upf_noncontig++;
+    return nullptr;
+  }
+  auto it = host_cache_.find(t.data);
+  if (it != host_cache_.end()) return &it->second;
+  VkDeviceSize bytes = VkDeviceSize(t.nbytes());
+  ink::vk::Buffer b = alloc_.alloc_host(bytes);
+  if (!alloc_.ok(b)) {
+    stats.upf_alloc++;
+    return nullptr;
+  }
+  std::memcpy(alloc_.mapped(b), t.data, size_t(bytes));
+  stats.uploads++;
+  stats.upload_bytes += bytes;
+  auto [ins, _] = host_cache_.emplace(t.data, b);
+  (void)_;
+  return &ins->second;
+}
+
 bool VkBackend::matvec(const TensorView& W, const float* x, float* out,
                        int64_t M, int64_t K) {
-  if (!ok_ || W.nd != 2 || W.shape[0] != M || W.shape[1] != K) return false;
+  if (!ok_ || W.nd != 2 || W.shape[0] != M || W.shape[1] != K) {
+    stats.rej_shape++;
+    return false;
+  }
   Pipe* pipe = nullptr;
   switch (W.dtype) {
     case DType::F32:
       pipe = &mv_f32_;
       break;
     case DType::BF16:
-      if (K % 2) return false;
+      if (K % 2) {
+        stats.rej_shape++;
+        return false;
+      }
       pipe = &mv_bf16_;
       break;
     case DType::F8E4M3:
-      if (K % 4) return false;
+      if (K % 4) {
+        stats.rej_shape++;
+        return false;
+      }
       pipe = &mv_f8_;
       break;
     default:
+      stats.rej_dtype++;
       return false;  // U8/I8 stay on CPU
   }
   const ink::vk::Buffer* w = upload(W);
-  if (!w) return false;
-  if (!grow_host(xbuf_, VkDeviceSize(K) * 4) ||
-      !grow_host(obuf_, VkDeviceSize(M) * 4))
+  if (!w) {
+    stats.rej_upload++;
     return false;
+  }
+  if (!grow_host(xbuf_, VkDeviceSize(K) * 4) ||
+      !grow_host(obuf_, VkDeviceSize(M) * 4)) {
+    stats.rej_alloc++;
+    return false;
+  }
   std::memcpy(alloc_.mapped(xbuf_), x, size_t(K) * 4);
   const ink::vk::Buffer* b3[3] = {w, &xbuf_, &obuf_};
   if (!write_n(pipe->ds, b3, 3)) return false;
@@ -218,10 +300,14 @@ bool VkBackend::matvec(const TensorView& W, const float* x, float* out,
     rec.push_constants(pipe->p.layout, &pc, sizeof(pc));
     rec.dispatch(uint32_t(std::min<int64_t>(M - m0, 65535)));
   }
+  auto t0 = std::chrono::steady_clock::now();
   if (!rec.end_and_submit(ctx_.compute_queue)) {
     rec.shutdown();
     return false;
   }
+  stats.wait_ms += ms_since(t0);
+  stats.submits++;
+  stats.n_matvec++;
   rec.shutdown();
   std::memcpy(out, alloc_.mapped(obuf_), size_t(M) * 4);
   return true;
@@ -236,20 +322,29 @@ bool VkBackend::expert_ffn(const TensorView& w13, const TensorView& w13s,
                            float* out) {
   if (!ok_) return false;
   const uint32_t align = mxfp8 ? 128 : 64;
-  if (D % align || I % align) return false;
+  if (D % align || I % align) {
+    stats.rej_shape++;
+    return false;
+  }
 
   const ink::vk::Buffer* bufs[8];
   const TensorView* ts[8] = {&w13, &w13s, &w13amax, &w13osd,
                              &w2,  &w2s,  &w2amax,  &w2osd};
   for (int i = 0; i < 8; i++) {
-    bufs[i] = ts[i]->data ? upload(*ts[i]) : &dummy4_;
-    if (!bufs[i]) return false;
+    // Experts stream from RAM: only the selected rows cross PCIe.
+    bufs[i] = ts[i]->data ? host_buf(*ts[i]) : &dummy4_;
+    if (!bufs[i]) {
+      stats.rej_upload++;
+      return false;
+    }
   }
   if (!grow_host(xbuf_, VkDeviceSize(D) * 4) ||
       !grow_dev(gbuf_, VkDeviceSize(I) * 4) ||
       !grow_dev(ubuf_, VkDeviceSize(I) * 4) ||
-      !grow_host(eobuf_, VkDeviceSize(D) * 4))
+      !grow_host(eobuf_, VkDeviceSize(D) * 4)) {
+    stats.rej_alloc++;
     return false;
+  }
   std::memcpy(alloc_.mapped(xbuf_), x, size_t(D) * 4);
   std::memcpy(alloc_.mapped(eobuf_), out, size_t(D) * 4);
 
@@ -267,10 +362,13 @@ bool VkBackend::expert_ffn(const TensorView& w13, const TensorView& w13s,
     const ink::vk::Buffer* mg[4] = {bufs[0], bufs[1], &xbuf_, &gbuf_};
     const ink::vk::Buffer* mu[4] = {bufs[0], bufs[1], &xbuf_, &ubuf_};
     if (!write_n(p13.ds, mg, 4) || !write_n(p13.ds2, mu, 4) ||
-        !write_n(moe_acc_.ds, bd, 7))
+        !write_n(moe_acc_.ds, bd, 7)) {
+      stats.rej_submit++;
       return false;
+    }
   } else if (!write_n(p13.ds, bg, 6) || !write_n(p13.ds2, bu, 6) ||
              !write_n(moe_acc_.ds, bd, 7)) {
+    stats.rej_submit++;
     return false;
   }
 
@@ -302,10 +400,14 @@ bool VkBackend::expert_ffn(const TensorView& w13, const TensorView& w13s,
     rec.push_constants(moe_acc_.p.layout, &pc, sizeof(pc));
     rec.dispatch(uint32_t(D));
   }
+  auto t0 = std::chrono::steady_clock::now();
   if (!rec.end_and_submit(ctx_.compute_queue)) {
     rec.shutdown();
     return false;
   }
+  stats.wait_ms += ms_since(t0);
+  stats.submits++;
+  stats.n_ffn++;
   rec.shutdown();
   std::memcpy(out, alloc_.mapped(eobuf_), size_t(D) * 4);
   return true;

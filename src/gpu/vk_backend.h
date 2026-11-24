@@ -49,12 +49,15 @@ class VkBackend : public ops::Backend {
   Pipe mv_f32_, mv_bf16_, mv_f8_, mv_nv4_, mv_mx8_, moe_acc_;
 
   // Weight cache: TensorView.data -> device-local buffer. LRU eviction
-  // against cache_cap_.
+  // against cache_cap_. host_cache_: expert tensors mirrored into
+  // HOST_VISIBLE memory once — the GPU streams only the rows it needs
+  // over PCIe (8/128 experts per layer), no VRAM residency, no churn.
   struct Cached {
     ink::vk::Buffer b;
     uint64_t tick = 0;
   };
   std::unordered_map<const void*, Cached> cache_;
+  std::unordered_map<const void*, ink::vk::Buffer> host_cache_;
   uint64_t tick_ = 0;
   VkDeviceSize cache_bytes_ = 0, cache_cap_ = 0;
 
@@ -67,9 +70,26 @@ class VkBackend : public ops::Backend {
   bool ok_ = false;
   std::string err_;
 
+ public:
+  // P2 instrumentation: cumulative counters, read for reporting.
+  struct Stats {
+    uint64_t submits = 0, uploads = 0, upload_bytes = 0;
+    double wait_ms = 0, upload_ms = 0;
+    uint64_t n_matvec = 0, n_ffn = 0;
+    // reject reasons (why a call fell back to CPU)
+    uint64_t rej_shape = 0, rej_dtype = 0, rej_upload = 0, rej_alloc = 0,
+             rej_submit = 0;
+    uint64_t upf_noncontig = 0, upf_toobig = 0, upf_alloc = 0, upf_rec = 0;
+    uint64_t upf_begin = 0, upf_submit = 0;
+    std::string first_err;
+  } stats;
+
   // Upload t.data (contiguous only) to device memory; cached by pointer.
   // Returns nullptr when the tensor can't be served (non-contiguous, OOM).
   const ink::vk::Buffer* upload(const TensorView& t);
+  // Mirror t.data into a persistent HOST_VISIBLE buffer (one memcpy, kept
+  // for the run). GPU reads it over PCIe on demand.
+  const ink::vk::Buffer* host_buf(const TensorView& t);
   void evict_for(VkDeviceSize need);
 
   bool grow_host(ink::vk::Buffer& b, VkDeviceSize bytes);

@@ -187,7 +187,8 @@ bool Recorder::submit_and_wait(VkQueue q) {
   VkResult r = vkQueueSubmit(q, 1, &si, f);
   if (r != VK_SUCCESS) {
     ctx_->destroy_fence(f);
-    return fail("vkQueueSubmit");
+    err_ = std::string("vkQueueSubmit ") + result_name(r);
+    return false;
   }
   bool ok = ctx_->wait_fence(f);
   if (!ok) err_ = ctx_->last_error;

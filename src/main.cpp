@@ -7,6 +7,7 @@
 #include "gpu/vk_backend.h"
 #endif
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -211,6 +212,7 @@ int main(int argc, char** argv) {
   }
   int cur = ops::argmax(g.state().logits.data(),
                         int(g.state().logits.size()));
+  auto wall0 = std::chrono::steady_clock::now();
   std::vector<int> gen_ids;
   for (int t = 0; t < gen_tokens; t++) {
     cur_step = t + 1;
@@ -227,5 +229,34 @@ int main(int argc, char** argv) {
   }
   if (tok_loaded && !gen_ids.empty())
     std::printf("text: %s\n", tok.decode(gen_ids).c_str());
+  double wall = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - wall0)
+                    .count();
+  std::printf("wall: %.2fs for %lld tokens (%.2f s/tok)\n", wall,
+              (long long)(pos - (int64_t)ids.size()),
+              wall / std::max<int64_t>(1, pos - (int64_t)ids.size()));
+#ifdef INK_WITH_VULKAN
+  if (backend == "vk") {
+    auto& st = vk_backend.stats;
+    std::printf(
+        "vk: submits=%llu wait=%.0fms uploads=%llu (%.2fGB %.0fms) "
+        "matvec=%llu ffn=%llu rej{sh%llu dt%llu up%llu al%llu su%llu}\n",
+        (unsigned long long)st.submits, st.wait_ms,
+        (unsigned long long)st.uploads, st.upload_bytes / 1e9, st.upload_ms,
+        (unsigned long long)st.n_matvec, (unsigned long long)st.n_ffn,
+        (unsigned long long)st.rej_shape, (unsigned long long)st.rej_dtype,
+        (unsigned long long)st.rej_upload, (unsigned long long)st.rej_alloc,
+        (unsigned long long)st.rej_submit);
+    std::printf("  upf{noncontig %llu toobig %llu alloc %llu rec %llu "
+                "(begin %llu submit %llu)} err: %s\n",
+                (unsigned long long)st.upf_noncontig,
+                (unsigned long long)st.upf_toobig,
+                (unsigned long long)st.upf_alloc,
+                (unsigned long long)st.upf_rec,
+                (unsigned long long)st.upf_begin,
+                (unsigned long long)st.upf_submit,
+                st.first_err.c_str());
+  }
+#endif
   return 0;
 }
