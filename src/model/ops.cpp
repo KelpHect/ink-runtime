@@ -1,6 +1,7 @@
 #include "ops.h"
 
 #include "backend.h"
+#include "io/safetensors.h"
 
 #include <algorithm>
 #include <cmath>
@@ -426,6 +427,16 @@ void moe_forward(const ModelConfig& c, const MlpW& m, const float* x,
       std::fprintf(stderr, "\n");
     }
   }
+  if (const char* idf = std::getenv("INK_IDS")) {
+    static FILE* f = std::fopen(idf, "a");
+    static long call = 0;
+    if (f) {
+      std::fprintf(f, "%ld", call++);
+      for (int i = 0; i < k; i++) std::fprintf(f, " %d", idx[i]);
+      std::fprintf(f, "\n");
+      std::fflush(f);
+    }
+  }
 
   const ExpertW& E = m.experts;
   std::vector<float> gate(I), up(I), a(I);
@@ -456,6 +467,283 @@ void moe_forward(const ModelConfig& c, const MlpW& m, const float* x,
       out[r] += w[i] * expert_dot(E.w2, E.w2s, E.w2amax, E.w2osd, E.mxfp8, e,
                                   r, a.data(), I);
   }
+}
+
+// ==================================================================
+// CpuDraft — CPU reference for the MTP/DFlare speculative draft head
+// (research/07 §9). Mirrors src/gpu/gpu_draft.cpp emit_block exactly:
+// fp32 accumulate, bf16 rounding on residual adds and markov
+// intermediates. Kept append-only; the golden gate arbitrates.
+// ==================================================================
+
+namespace {
+
+void draft_rope_head(float* v, int64_t pos, double theta) {
+  // GPT-NeoX half-split: pairs (d, d+64), inv_freq[d] = theta^(-d/64).
+  for (int d = 0; d < 64; d++) {
+    const double ang = double(pos) * std::pow(theta, -double(d) / 64.0);
+    const float c = float(std::cos(ang)), s = float(std::sin(ang));
+    const float x1 = v[d], x2 = v[d + 64];
+    v[d] = x1 * c - x2 * s;
+    v[d + 64] = x2 * c + x1 * s;
+  }
+}
+
+}  // namespace
+
+bool CpuDraft::init(const ModelConfig& c, const SafetensorsFile& mtp,
+                    const TensorView& embed, const TensorView& embn,
+                    const TensorView& unemb, std::string* err) {
+  cfg = &c;
+  embed_ = embed;
+  embn_ = embn;
+  unemb_ = unemb;
+  std::vector<std::string> missing;
+  auto get = [&](const char* n, TensorView& t) {
+    if (const TensorView* p = mtp.find(n))
+      t = *p;
+    else
+      missing.push_back(n);
+  };
+  get("fuse_weight", w.fuse_w);
+  get("norm.weight", w.norm);
+  get("mask_embed", w.mask_embed);
+  get("markov_head.dflare_norm.weight", w.dgam[3]);
+  get("markov_head.markov_w1.weight", w.w1);
+  get("markov_head.rnn_proj.weight", w.rnn);
+  get("markov_head.rnn_proj.bias", w.rnn_b);
+  get("markov_head.hidden_out.weight", w.hout);
+  get("markov_head.hidden_out.bias", w.hout_b);
+  for (int i = 0; i < 3; i++) {
+    char buf[64];
+    auto L = [&](const char* s, TensorView& t) {
+      std::snprintf(buf, sizeof(buf), "layers.%d.%s", i, s);
+      get(buf, t);
+    };
+    L("dflare_norm.weight", w.dgam[i]);
+    L("input_layernorm.weight", w.inln[i]);
+    L("post_attention_layernorm.weight", w.pln[i]);
+    L("self_attn.q_norm.weight", w.qn[i]);
+    L("self_attn.k_norm.weight", w.kn[i]);
+    L("self_attn.k_norm_ctx.weight", w.knc[i]);
+    L("self_attn.q_proj.weight", w.wq[i]);
+    L("self_attn.k_proj.weight", w.wk[i]);
+    L("self_attn.v_proj.weight", w.wv[i]);
+    L("self_attn.o_proj.weight", w.wo[i]);
+    L("self_attn.k_proj_ctx.weight", w.wkc[i]);
+    L("self_attn.v_proj_ctx.weight", w.wvc[i]);
+    L("mlp.gate_proj.weight", w.wg[i]);
+    L("mlp.up_proj.weight", w.wu[i]);
+    L("mlp.down_proj.weight", w.wd[i]);
+  }
+  if (!missing.empty()) {
+    *err = "cpu draft: " + std::to_string(missing.size()) +
+           " tensors missing, first: " + missing.front();
+    return false;
+  }
+  reset();
+  return true;
+}
+
+std::vector<int> CpuDraft::propose(const float* taps4, int anchor,
+                                   int64_t pos) {
+  const ModelConfig& c = *cfg;
+  const int H = c.mtp.hidden_size;
+  const int I = c.mtp.intermediate_size;
+  const int HQ = c.mtp.num_attention_heads, HK = c.mtp.num_key_value_heads;
+  const int DH = c.mtp.head_dim;
+  const int64_t V = c.unpadded_vocab_size;
+  const float eps = float(c.mtp.rms_norm_eps);
+  const bool appending = n_ctx < CTX_MAX;
+  const int64_t nctx = n_ctx + (appending ? 1 : 0);
+
+  // ---- fused contexts (fp32 mix -> rmsnorm) ----
+  float alpha[4][4];
+  for (int r = 0; r < 4; r++) {
+    float m = -1e30f;
+    for (int j = 0; j < 4; j++) m = std::max(m, w.fuse_w.f32(r, j));
+    float s = 0.f;
+    for (int j = 0; j < 4; j++) s += (alpha[r][j] = std::exp(w.fuse_w.f32(r, j) - m));
+    for (int j = 0; j < 4; j++) alpha[r][j] /= s;
+  }
+  std::vector<float> ctx(4 * H), mix(H);
+  for (int cc = 0; cc < 4; cc++) {
+    for (int i = 0; i < H; i++)
+      mix[i] = alpha[cc][0] * taps4[i] + alpha[cc][1] * taps4[H + i] +
+               alpha[cc][2] * taps4[2 * H + i] +
+               alpha[cc][3] * taps4[3 * H + i];
+    rmsnorm(mix.data(), w.dgam[cc], ctx.data() + cc * H, H, eps);
+  }
+
+  // ---- block input: row 0 = embed_norm(anchor), rows 1..7 = mask_embed ----
+  std::vector<float> x(8 * H), xn(8 * H);
+  {
+    std::vector<float> e(H);
+    const int64_t off = int64_t(anchor) * H;
+    for (int i = 0; i < H; i++) e[i] = embed_.f32_linear(off + i);
+    rmsnorm(e.data(), embn_, x.data(), H, eps);
+    for (int j = 1; j < 8; j++)
+      for (int i = 0; i < H; i++) x[j * H + i] = w.mask_embed.f32(i);
+  }
+
+  const bool dbg = std::getenv("INK_DRAFT_DEBUG") != nullptr;
+  if (dbg) dbg_xin = x;
+  std::vector<float> q(8 * HQ * DH), kb(8 * HK * DH), vb(8 * HK * DH);
+  std::vector<float> att(8 * HQ * DH), scr(8 * H);
+  for (int li = 0; li < 3; li++) {
+    // ---- ctx-KV append (anchor's fused features at this layer) ----
+    std::vector<float> kc(HK * DH), vc(HK * DH);
+    matvec(w.wkc[li], ctx.data() + li * H, kc.data(), HK * DH, H);
+    matvec(w.wvc[li], ctx.data() + li * H, vc.data(), HK * DH, H);
+    for (int h = 0; h < HK; h++)
+      rmsnorm(kc.data() + h * DH, w.knc[li], kc.data() + h * DH, DH, eps);
+    for (int h = 0; h < HK; h++)
+      draft_rope_head(kc.data() + h * DH, pos, c.mtp.rope_theta);
+    if (dbg && li == 0) dbg_ctxk0 = kc;
+    if (appending) {
+      ctxk[li].insert(ctxk[li].end(), kc.begin(), kc.end());
+      ctxv[li].insert(ctxv[li].end(), vc.begin(), vc.end());
+      if (li == 0) ctxpos.push_back(pos);
+    }
+
+    // ---- block layer ----
+    for (int j = 0; j < 8; j++)
+      rmsnorm(x.data() + j * H, w.inln[li], xn.data() + j * H, H, eps);
+    if (dbg && li == 0) dbg_xn0 = xn;
+    for (int j = 0; j < 8; j++) {
+      matvec(w.wq[li], xn.data() + j * H, q.data() + j * HQ * DH, HQ * DH, H);
+      matvec(w.wk[li], xn.data() + j * H, kb.data() + j * HK * DH, HK * DH, H);
+      matvec(w.wv[li], xn.data() + j * H, vb.data() + j * HK * DH, HK * DH, H);
+    }
+    for (int j = 0; j < 8; j++) {
+      for (int h = 0; h < HQ; h++)
+        rmsnorm(q.data() + (j * HQ + h) * DH, w.qn[li],
+                q.data() + (j * HQ + h) * DH, DH, eps);
+      for (int h = 0; h < HK; h++)
+        rmsnorm(kb.data() + (j * HK + h) * DH, w.kn[li],
+                kb.data() + (j * HK + h) * DH, DH, eps);
+      for (int h = 0; h < HQ; h++)
+        draft_rope_head(q.data() + (j * HQ + h) * DH, pos + j,
+                        c.mtp.rope_theta);
+      for (int h = 0; h < HK; h++)
+        draft_rope_head(kb.data() + (j * HK + h) * DH, pos + j,
+                        c.mtp.rope_theta);
+    }
+    if (dbg && li == 0) {
+      dbg_q0 = q;
+      dbg_k0 = kb;
+    }
+    // non-causal block attention over [ctx ++ block] keys, GQA g = h/3
+    const bool local = std::find(c.mtp.local_layer_ids.begin(),
+                                 c.mtp.local_layer_ids.end(),
+                                 li) != c.mtp.local_layer_ids.end();
+    const float scale = float(1.0 / std::sqrt(double(DH)));
+    std::vector<float> s(nctx + 8);
+    for (int j = 0; j < 8; j++) {
+      const int64_t qpos = pos + j;
+      for (int h = 0; h < HQ; h++) {
+        const int g = h * HK / HQ;
+        const float* qh = q.data() + (j * HQ + h) * DH;
+        for (int64_t kk = 0; kk < nctx; kk++) {
+          const int64_t kpos = ctxpos[size_t(kk)];
+          const bool vis =
+              !local || (kpos <= qpos &&
+                         (qpos - kpos) < c.mtp.sliding_window_size);
+          s[kk] = vis ? dot(qh, ctxk[li].data() + kk * HK * DH + g * DH, DH) *
+                            scale
+                      : -1e30f;
+        }
+        for (int kk = 0; kk < 8; kk++)
+          s[nctx + kk] =
+              dot(qh, kb.data() + (kk * HK + g) * DH, DH) * scale;
+        softmax(s.data(), int(nctx + 8));
+        float* oh = att.data() + (j * HQ + h) * DH;
+        for (int d = 0; d < DH; d++) {
+          float a = 0.f;
+          for (int64_t kk = 0; kk < nctx; kk++)
+            a += s[kk] * ctxv[li][size_t(kk) * HK * DH + g * DH + d];
+          for (int kk = 0; kk < 8; kk++)
+            a += s[nctx + kk] * vb[size_t(kk) * HK * DH + g * DH + d];
+          oh[d] = a;
+        }
+      }
+    }
+    if (dbg && li == 0) dbg_att0 = att;
+    for (int j = 0; j < 8; j++) {
+      matvec(w.wo[li], att.data() + j * HQ * DH, scr.data() + j * H, H,
+             HQ * DH);
+      for (int i = 0; i < H; i++)
+        x[j * H + i] = bf16_round(x[j * H + i] + scr[j * H + i]);
+    }
+    for (int j = 0; j < 8; j++)
+      rmsnorm(x.data() + j * H, w.pln[li], xn.data() + j * H, H, eps);
+    std::vector<float> gg(I), uu(I), aa(I);
+    for (int j = 0; j < 8; j++) {
+      matvec(w.wg[li], xn.data() + j * H, gg.data(), I, H);
+      matvec(w.wu[li], xn.data() + j * H, uu.data(), I, H);
+      for (int i = 0; i < I; i++)
+        aa[i] = gg[i] * sigmoid(gg[i]) * uu[i];
+      matvec(w.wd[li], aa.data(), scr.data() + j * H, H, I);
+      for (int i = 0; i < H; i++)
+        x[j * H + i] = bf16_round(x[j * H + i] + scr[j * H + i]);
+    }
+    if (dbg)
+      dbg_xall.insert(dbg_xall.end(), x.begin(), x.end());
+  }
+
+  // ---- final norm + base logits ----
+  std::vector<float> out8(8 * H);
+  for (int j = 0; j < 8; j++)
+    rmsnorm(x.data() + j * H, w.norm, out8.data() + j * H, H, eps);
+  std::vector<float> base(8 * V);
+  for (int j = 0; j < 8; j++)
+    matvec(unemb_, out8.data() + j * H, base.data() + j * V, V, H);
+  if (dbg) {
+    dbg_ctx = ctx;
+    dbg_out8 = out8;
+    dbg_base0.assign(base.data(), base.data() + V);
+  }
+
+  // ---- markov head: 7 steps (DFlash fill-in layout) ----
+  // Slot 0 is the anchor seed (unsampled); markov step i consumes slot
+  // i+1's hidden/base — a mask slot at position pos+1+i predicting the
+  // token AT that same position. ids[0..6] predict pos+1 .. pos+7;
+  // ids[7] = spare argmax over slot-7 base logits.
+  std::vector<int> ids(8, 0);
+  std::vector<float> state(256, 0.f), lat(256), in(5120), proj(768),
+      dvec(H);
+  int prev = anchor;
+  for (int i = 0; i < 7; i++) {
+    for (int k = 0; k < 256; k++) in[k] = bf16_round(state[k]);
+    for (int k = 0; k < 256; k++)
+      in[256 + k] = w.w1.f32_linear(int64_t(prev) * 256 + k);  // already bf16
+    for (int k = 0; k < H; k++)
+      in[512 + k] = bf16_round(out8[(i + 1) * H + k]);  // fill-in slot i+1
+    for (int k = 0; k < H; k++)
+      in[512 + H + k] = bf16_round(ctx[3 * H + k]);
+    matvec(w.rnn, in.data(), proj.data(), 768, 5120);
+    for (int k = 0; k < 768; k++)
+      proj[k] = bf16_round(proj[k] + w.rnn_b.f32(k));
+    for (int k = 0; k < 256; k++) {
+      const float gate = bf16_round(sigmoid(proj[k]));
+      const float cand = bf16_round(std::tanh(proj[256 + k]));
+      lat[k] = bf16_round(std::tanh(proj[512 + k]));
+      state[k] = bf16_round(gate * state[k] + (1.f - gate) * cand);
+    }
+    matvec(w.hout, lat.data(), dvec.data(), H, 256);
+    for (int d = 0; d < H; d++) dvec[d] += w.hout_b.f32(d);
+    std::vector<float> tmp(V);
+    matvec(unemb_, dvec.data(), tmp.data(), V, H);
+    for (int64_t v = 0; v < V; v++)
+      tmp[v] =
+          30.f * std::tanh(
+              bf16_round(bf16_round(base[(i + 1) * V + v]) + tmp[v]) / 30.f);
+    ids[i] = argmax(tmp.data(), int(V));
+    prev = ids[i];
+  }
+  ids[7] = argmax(base.data() + 7 * V, int(V));
+  if (appending) n_ctx++;
+  return ids;
 }
 
 }  // namespace ink::ops

@@ -1,0 +1,30 @@
+#version 460
+
+// draft_rope.comp — GPT-NeoX half-split rotary for the draft head.
+//
+// Workgroup g (gl_WorkGroupID.x) rotates one head_dim=128 vector at
+// position pc.pos0 + (g / pc.per_row). Lane d in 0..63 handles the
+// (d, d+64) pair: inv_freq[d] = theta^(-d/64), angle = pos * inv_freq.
+// Dispatch: num_workgroups.x = total head count (rows * heads_per_row).
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) buffer XBuf { float x[]; };
+
+layout(push_constant) uniform Pc {
+    uint  per_row;   // heads per position slot
+    uint  pos0;      // absolute position of slot 0
+    float theta;     // rope base (1e6 for the draft head)
+} pc;
+
+void main() {
+    const uint g = gl_WorkGroupID.x;
+    const uint d = gl_LocalInvocationID.x;   // 0..63
+    const float pos = float(pc.pos0 + g / pc.per_row);
+    const float ang = pos * pow(pc.theta, -float(d) / 64.0);
+    const float c = cos(ang), s = sin(ang);
+    const uint b = g * 128u + d;
+    const float x1 = x[b], x2 = x[b + 64u];
+    x[b]       = x1 * c - x2 * s;
+    x[b + 64u] = x2 * c + x1 * s;
+}

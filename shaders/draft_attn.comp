@@ -1,0 +1,106 @@
+#version 460
+
+// draft_attn.comp — draft-head block attention, one wg per (q head, block row).
+//
+// Query j (grid.y) at position pos0+j attends, NON-causally, over:
+//   * n_ctx context keys (ctx rows appended once per committed position;
+//     positional window when pc.window > 0 — local layers 0/2), and
+//   * all 8 in-block keys (always visible).
+// GQA: kv head g = h/3 (h*HK/HQ). scale = DH^-0.5. No sink, no gate.
+//
+// Dispatch: grid = (24, 8). 64 lanes; scores cached in shared s[MAXK].
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer QBuf { float q[]; };    // [8*3072]
+layout(set = 0, binding = 1, std430) readonly buffer KC  { float kc[]; };   // [cap*1024]
+layout(set = 0, binding = 2, std430) readonly buffer VC  { float vc[]; };   // [cap*1024]
+layout(set = 0, binding = 3, std430) readonly buffer KB  { float kb[]; };   // [8*1024]
+layout(set = 0, binding = 4, std430) readonly buffer VB  { float vb[]; };   // [8*1024]
+layout(set = 0, binding = 5, std430) readonly buffer PB  { uint cp[]; };    // [cap]
+layout(set = 0, binding = 6, std430) writeonly buffer OB { float o[]; };    // [8*3072]
+
+layout(push_constant) uniform Pc {
+    uint  n_ctx;    // ctx rows visible (incl. the just-appended row)
+    uint  pos0;     // absolute position of block slot 0 (anchor)
+    uint  window;   // 0 = full; else visible iff qpos - kpos < window
+    float scale;
+} pc;
+
+#define MAXK 4232u   // ctx cap 4224 + 8 block keys
+
+shared float s[MAXK];
+shared float qs[128];
+shared float smax;
+shared float ssum;
+
+void main() {
+    const uint h = gl_WorkGroupID.x;         // q head 0..23
+    const uint j = gl_WorkGroupID.y;         // block row 0..7
+    const uint g = h / 3u;                   // kv head (GQA 24/8)
+    const uint tid = gl_LocalInvocationID.x;
+    const int  qpos = int(pc.pos0) + int(j);
+    const uint nctx = min(pc.n_ctx, MAXK - 8u);
+    const uint nkeys = nctx + 8u;
+
+    for (uint d = tid; d < 128u; d += 64u)
+        qs[d] = q[j * 3072u + h * 128u + d];
+    barrier();
+
+    // Scores: each lane owns keys kk = tid, tid+64, ... and runs the full
+    // 128-elem dot itself (key-parallel, no cross-lane reduce needed).
+    for (uint kk = tid; kk < nkeys; kk += 64u) {
+        float sc = -1e30;
+        if (kk < nctx) {
+            const int kpos = int(cp[kk]);
+            const bool vis = (pc.window == 0u) ||
+                             (kpos <= qpos && (qpos - kpos) < int(pc.window));
+            if (vis) {
+                const uint kb0 = kk * 1024u + g * 128u;
+                float acc = 0.0;
+                for (uint d = 0u; d < 128u; d++)
+                    acc += qs[d] * kc[kb0 + d];
+                sc = acc * pc.scale;
+            }
+        } else {
+            const uint kb0 = (kk - nctx) * 1024u + g * 128u;
+            float acc = 0.0;
+            for (uint d = 0u; d < 128u; d++)
+                acc += qs[d] * kb[kb0 + d];
+            sc = acc * pc.scale;
+        }
+        s[kk] = sc;
+    }
+    barrier();
+
+    // fp32 softmax over the nkeys entries (max-subtracted).
+    if (tid == 0u) {
+        float m = -1e30;
+        for (uint kk = 0u; kk < nkeys; kk++) m = max(m, s[kk]);
+        smax = m;
+    }
+    barrier();
+    for (uint kk = tid; kk < nkeys; kk += 64u)
+        s[kk] = exp(s[kk] - smax);
+    barrier();
+    if (tid == 0u) {
+        float z = 0.0;
+        for (uint kk = 0u; kk < nkeys; kk++) z += s[kk];
+        ssum = z;
+    }
+    barrier();
+
+    // out[j,h,d] = sum_k p_k * v[k][g,d]; lane owns dims tid and tid+64.
+    for (uint d = tid; d < 128u; d += 64u) {
+        float acc = 0.0;
+        for (uint kk = 0u; kk < nctx; kk++) {
+            const float p = s[kk] / ssum;
+            acc += p * vc[kk * 1024u + g * 128u + d];
+        }
+        for (uint kk = 0u; kk < 8u; kk++) {
+            const float p = s[nctx + kk] / ssum;
+            acc += p * vb[kk * 1024u + g * 128u + d];
+        }
+        o[j * 3072u + h * 128u + d] = acc;
+    }
+}

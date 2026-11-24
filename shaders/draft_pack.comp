@@ -1,0 +1,48 @@
+#version 460
+
+// draft_pack.comp — assemble the 5120-wide markov GRU input for one step:
+//   IN = [ bf16(state[256]) | bf16(markov_w1[prev,256]) |
+//          bf16(hidden[slot,2304]) | bf16(f_rnn=ctx[3,2304]) ]
+// DFlash fill-in: markov step i consumes the hidden of block slot i+1
+// (slot 0 is the anchor seed, unsampled) and the prev id from DID cell i
+// (cell 0 = anchor, cells >=1 filled by argmax_final of earlier steps).
+// All inputs bf16-rounded per the markov head's precision rule.
+// Dispatch: grid.x = 80 (5120 lanes).
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer SB { float st[]; };   // [256]
+layout(set = 0, binding = 1, std430) readonly buffer WB { uint  w[]; };    // [Vp*128] bf16
+layout(set = 0, binding = 2, std430) readonly buffer HB { float h[]; };    // [8*2304]
+layout(set = 0, binding = 3, std430) readonly buffer CB { float cx[]; };   // [4*2304]
+layout(set = 0, binding = 4, std430) readonly buffer DB { uint  did[]; };  // cells
+layout(set = 0, binding = 5, std430) writeonly buffer OB { float o[]; };   // [5120]
+
+layout(push_constant) uniform Pc { uint slot; } pc;
+
+float bf16r(float f) {
+    uint u = floatBitsToUint(f);
+    u += 0x7FFFu + ((u >> 16u) & 1u);
+    return uintBitsToFloat(u & 0xFFFF0000u);
+}
+
+float bf16_at(uint elem) {   // element of W1's packed u32 stream
+    uint u = w[elem >> 1] >> ((elem & 1u) * 16u);
+    return uintBitsToFloat((u & 0xFFFFu) << 16);
+}
+
+void main() {
+    const uint k = gl_WorkGroupID.x * 64u + gl_LocalInvocationID.x;
+    float v;
+    if (k < 256u) {
+        v = bf16r(st[k]);
+    } else if (k < 512u) {
+        const uint tok = did[pc.slot * 16u];
+        v = bf16_at(tok * 256u + (k - 256u));   // already bf16 on disk
+    } else if (k < 2816u) {
+        v = bf16r(h[(pc.slot + 1u) * 2304u + (k - 512u)]);
+    } else {
+        v = bf16r(cx[3u * 2304u + (k - 2816u)]);
+    }
+    o[k] = v;
+}

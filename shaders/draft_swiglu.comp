@@ -1,0 +1,20 @@
+#version 460
+
+// draft_swiglu.comp — plain SwiGLU for the draft MLP (no softcaps):
+//   a[i] = silu(g[i]) * u[i] = g[i] * sigmoid(g[i]) * u[i]
+// Dispatch: grid.x = ceil(n/64), n = 8*9216.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer GB { float g[]; };
+layout(set = 0, binding = 1, std430) readonly buffer UB { float u[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer AB { float a[]; };
+
+layout(push_constant) uniform Pc { uint n; } pc;
+
+void main() {
+    const uint i = gl_WorkGroupID.x * 64u + gl_LocalInvocationID.x;
+    if (i >= pc.n) return;
+    const float gv = g[i];
+    a[i] = gv / (1.0 + exp(-gv)) * u[i];
+}

@@ -1,0 +1,48 @@
+#version 460
+
+// draft_logits.comp — folded markov logits for one draft step:
+//   fold[v] = unembed[v,:] . dvec          (dvec = hout@lat + hout_bias)
+//   s       = bf16(bf16(base[slot+1,v]) + fold)
+//   OUT[v]  = 30 * tanh(s / 30)            (softcap 30)
+// DFlash fill-in: markov step i folds into the base logits of slot i+1
+// (slot 0 is the anchor seed, unsampled; mask slots predict own pos).
+//
+// One lane per vocab entry; the 2304-dim dot reads the bf16-packed
+// unembed row as u32 pairs (matvec_bf16's access pattern). V = 200058;
+// dispatch grid.x = ceil(V/64) = 3126.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer BB { float b[]; }; // [8*VSTR]
+layout(set = 0, binding = 1, std430) readonly buffer UB { uint  u[]; }; // bf16 pairs
+layout(set = 0, binding = 2, std430) readonly buffer DB { float d[]; }; // [2304]
+layout(set = 0, binding = 3, std430) writeonly buffer OB { float o[]; }; // [V]
+
+layout(push_constant) uniform Pc { uint slot; } pc;
+
+#define V    200058u
+#define VSTR 200064u
+#define K    2304u
+
+float bf16r(float f) {
+    uint u = floatBitsToUint(f);
+    u += 0x7FFFu + ((u >> 16u) & 1u);
+    return uintBitsToFloat(u & 0xFFFF0000u);
+}
+
+vec2 unpk(uint u) {
+    return vec2(uintBitsToFloat(u << 16), uintBitsToFloat(u & 0xFFFF0000u));
+}
+
+void main() {
+    const uint v = gl_WorkGroupID.x * 64u + gl_LocalInvocationID.x;
+    if (v >= V) return;
+    const uint row = v * (K / 2u);   // u32 words per bf16 row
+    float acc = 0.0;
+    for (uint k = 0u; k < K / 2u; k++) {
+        const vec2 w = unpk(u[row + k]);
+        acc += w.x * d[2u * k] + w.y * d[2u * k + 1u];
+    }
+    const float s = bf16r(bf16r(b[(pc.slot + 1u) * VSTR + v]) + acc);
+    o[v] = 30.0 * tanh(s / 30.0);
+}

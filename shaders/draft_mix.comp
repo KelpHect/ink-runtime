@@ -1,0 +1,51 @@
+#version 460
+
+// draft_mix.comp — DFlare fused-context build for the MTP draft head.
+//
+// ctx[c,:] = rmsnorm_w( sum_j alpha[c,j] * taps[j,:], gamma_c ), fp32 mix.
+// One workgroup (64 threads) per consumer c = gl_WorkGroupID.x in 0..3
+// (draft layers 0..2, consumer 3 = markov f_rnn). alpha = softmax of the
+// checkpoint's fuse_weight[4,4] rows (host-precomputed, fp32).
+//
+// Dispatch: num_workgroups.x = 4.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer TBuf { float t[]; }; // [4H]
+layout(set = 0, binding = 1, std430) readonly buffer ABuf { float a[]; }; // [16]
+layout(set = 0, binding = 2, std430) readonly buffer GBuf { float g[]; }; // [4H]
+layout(set = 0, binding = 3, std430) writeonly buffer OBuf { float o[]; };// [4H]
+
+layout(push_constant) uniform Pc {
+    uint  n;
+    float eps;
+} pc;
+
+shared float red[64];
+shared float mx[2304];   // fp32 mix, normalized in place
+
+void main() {
+    const uint c = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint base = c * pc.n;
+
+    // fp32 weighted mix of the 4 taps, then sum of squares for the norm.
+    float ss = 0.0;
+    for (uint i = tid; i < pc.n; i += 64u) {
+        float v = a[c * 4u + 0u] * t[0u * pc.n + i]
+                + a[c * 4u + 1u] * t[1u * pc.n + i]
+                + a[c * 4u + 2u] * t[2u * pc.n + i]
+                + a[c * 4u + 3u] * t[3u * pc.n + i];
+        ss += v * v;
+        mx[i] = v;
+    }
+    red[tid] = ss;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    const float rstd = 1.0 / sqrt(red[0] / float(pc.n) + pc.eps);
+    for (uint i = tid; i < pc.n; i += 64u)
+        o[base + i] = mx[i] * rstd * g[base + i];
+}

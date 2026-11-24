@@ -2,6 +2,7 @@
 
 #include "ink/tensor.h"
 #include "io/config.h"
+#include "io/safetensors.h"
 
 #include <vector>
 
@@ -105,5 +106,50 @@ struct MlpW {
 // Router + top-k experts + softcapped SwiGLU, fp32 accumulate.
 void moe_forward(const ModelConfig& c, const MlpW& m, const float* x,
                  float* out);
+
+// ------------------------------------------------------------------
+// CpuDraft — CPU reference for the MTP/DFlare speculative draft head
+// (research/07 §9; GPU twin: src/gpu/gpu_draft.*). Same math, same
+// bf16 rounding discipline, kept append-only at the bottom of ops.cpp.
+// Per propose(): fuse taps -> per-layer ctx-KV append -> 3-layer
+// non-causal block of 8 -> base logits via shared unembed -> 7 markov
+// GRU steps -> 8 proposed ids.
+struct DraftW {
+  TensorView fuse_w, norm, mask_embed;                    // globals
+  TensorView dgam[4];                                     // 3 layers + markov
+  TensorView inln[3], pln[3], qn[3], kn[3], knc[3];
+  TensorView wq[3], wk[3], wv[3], wo[3], wkc[3], wvc[3];
+  TensorView wg[3], wu[3], wd[3];
+  TensorView w1, rnn, rnn_b, hout, hout_b;                // markov head
+};
+
+struct CpuDraft {
+  const ModelConfig* cfg = nullptr;
+  DraftW w;
+  static constexpr int64_t CTX_MAX = 4224;
+  std::vector<float> ctxk[3], ctxv[3];  // [n][1024] f32
+  std::vector<int64_t> ctxpos;
+  int64_t n_ctx = 0;
+
+  // embed/embn/unemb are the shared target tensors (from WeightStore).
+  bool init(const ModelConfig& c, const ink::SafetensorsFile& mtp,
+            const TensorView& embed, const TensorView& embn,
+            const TensorView& unemb, std::string* err);
+  void reset() { n_ctx = 0; }
+  // taps4 = 4*H contiguous fp32 (visit5/23/41 inputs + final normed).
+  // Proposes ids for positions anchor_pos+1 .. anchor_pos+7 (DFlash
+  // fill-in); ids[7] is a spare argmax over slot-7 base logits.
+  std::vector<int> propose(const float* taps4, int anchor, int64_t anchor_pos);
+
+  // Debug captures from the last propose() (INK_DRAFT_DEBUG): fused ctx
+  // [4*H], block output post-norm [8*H], slot-0 base-logit argmax context.
+  // dbg_xall = residual x after each layer: [3][8*H]. dbg_xin = staged
+  // block input [8H]; dbg_xn0/q0/k0 = L0 prenorm / q / k post norm+rope.
+  std::vector<float> dbg_ctx, dbg_out8, dbg_base0, dbg_xall, dbg_att0,
+      dbg_xin, dbg_xn0, dbg_q0, dbg_k0, dbg_ctxk0;
+
+ private:
+  TensorView embed_, embn_, unemb_;
+};
 
 }  // namespace ink::ops

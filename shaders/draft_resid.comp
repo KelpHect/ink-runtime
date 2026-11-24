@@ -1,0 +1,26 @@
+#version 460
+
+// draft_resid.comp — residual add with the draft head's bf16 rounding:
+//   out[i] = bf16_round(a[i] + b[i])
+// OUT may alias A or B (element-wise, same index). n = 8*2304.
+// Dispatch: grid.x = ceil(n/64).
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer AB { float a[]; };
+layout(set = 0, binding = 1, std430) readonly buffer BB { float b[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer OB { float o[]; };
+
+layout(push_constant) uniform Pc { uint n; } pc;
+
+float bf16r(float f) {
+    uint u = floatBitsToUint(f);
+    u += 0x7FFFu + ((u >> 16u) & 1u);
+    return uintBitsToFloat(u & 0xFFFF0000u);
+}
+
+void main() {
+    const uint i = gl_WorkGroupID.x * 64u + gl_LocalInvocationID.x;
+    if (i >= pc.n) return;
+    o[i] = bf16r(a[i] + b[i]);
+}

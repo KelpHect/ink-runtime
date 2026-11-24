@@ -1,0 +1,36 @@
+#version 460
+
+// draft_gru.comp — one markov-head GRU step (rnn_hidden, rank 256).
+//
+// raw = proj + rnn_bias (rnn_proj @ IN done upstream by matvec_bf16).
+// Split raw into three 256 gates, bf16-rounded per spec:
+//   gate = bf16(sigmoid(bf16(raw[i])))
+//   cand = bf16(tanh(bf16(raw[256+i])))
+//   lat  = bf16(tanh(bf16(raw[512+i])))
+//   state[i] = bf16(gate*state[i] + (1-gate)*cand)
+//   LAT[i] = lat
+// Dispatch: grid.x = 4 (256 lanes).
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer PB { float p[]; };    // [768]
+layout(set = 0, binding = 1, std430) readonly buffer BB { float b[]; };    // [768]
+layout(set = 0, binding = 2, std430) buffer           SB { float s[]; };   // [256]
+layout(set = 0, binding = 3, std430) writeonly buffer LB { float l[]; };   // [256]
+
+float bf16r(float f) {
+    uint u = floatBitsToUint(f);
+    u += 0x7FFFu + ((u >> 16u) & 1u);
+    return uintBitsToFloat(u & 0xFFFF0000u);
+}
+
+void main() {
+    const uint i = gl_WorkGroupID.x * 64u + gl_LocalInvocationID.x;
+    const float g8 = bf16r(p[i]         + b[i]);
+    const float c8 = bf16r(p[256u + i]  + b[256u + i]);
+    const float o8 = bf16r(p[512u + i]  + b[512u + i]);
+    const float gate = bf16r(1.0 / (1.0 + exp(-g8)));
+    const float cand = bf16r(tanh(c8));
+    l[i] = bf16r(tanh(o8));
+    s[i] = bf16r(gate * s[i] + (1.0 - gate) * cand);
+}
