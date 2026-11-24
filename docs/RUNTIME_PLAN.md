@@ -23,11 +23,21 @@ Ceilings/budgets: `docs/THEORY.md`. Model facts: `research/00-model-facts.md`.
 - Hardware probes done (`tools/vkprobe.c`, `vkbench.c`): FP8-E4M3 coopmat on Adrenalin verified, 18× 16×16×16 configs; SDMA copy = 32.5 GB/s (DDR4-bound); ReBAR + Gen5 x16 confirmed.
 - **Golden gate GREEN**: `tools/dump_golden.py` (HF ref, custom offload hooks — accelerate's own offload segfaults), `tools/compare_golden.py`, `tools/dump_visits.py` + `compare_visits.py` for per-visit bisection. All 48 visits cos ≥ 0.998, all 8 argmax match (bf16-vs-fp32 floor). Resolved bit-level: dynamic-conv taps lag=backward-distance (correct), **static conv1d taps were REVERSED — fixed** (w[..,3]=current), w13 interleave = pairs on disk (correct), sink-column + router renorm + message bank (2-src: last loop-boundary block + prev final) all verified correct.
 
-### P1 — vertical slice decode (weeks 1–3): one token out, correctness first
-- Vulkan backend skeleton (volk, device probe, slab allocator, cmd-pool, timeline sems).
-- Kernels v1 (correctness over speed): rmsnorm/L2-clip, RoPE-rel, sconv-4, dense GEMV bf16, NVFP4-dequant GEMV (naive), attention naive-but-correct (SWA + global + softcap + sink), router top-k + bias + softcap, embed/unembed, sampler.
-- CPU-only weight residency OK for v1 (RAM mirror → per-layer H2D staging). Goal: **greedy-equivalence vs HF reference on a test prompt**.
-- CLI: load, prompt, decode; `st_header.json` deleted (scratch file cleanup noted in research).
+### P1 — vertical slice decode — **DONE 2026-11-24**
+- `src/vk/` plumbing (Context: compute fam1 + SDMA fam2 picks, coopmat/f8/bf16 feature bits, timeline sems; slab Allocator; CmdPool/Recorder; pipeline+descset) — `test_vk_smoke` PASS on device.
+- `shaders/`: 24 correctness-first GLSL-460 kernels + `bindings.h` contract (all glslc-clean).
+- `src/io/tokenizer.*` byte-level BPE — `encode_chat_user` reproduces the golden 25 ids exactly.
+- `src/gpu/vk_backend.cpp`: `Backend` seam (`matvec` + batched `expert_ffn` = 3 dispatches/expert); `--backend vk`.
+- **Two hard bugs found**: (1) descriptor ranges are *buffer-relative* — binding at the slab offset shifted every descriptor past the buffer end → OOB → real Adrenalin TDR/DEVICE_LOST (only offset-0 buffers worked, so early ops passed then died); (2) chunked staging recorded all copies then reused the buffer — smeared the last chunk everywhere (whole-tensor staging now).
+- **Architecture pivot**: expert tensors live in persistent HOST_VISIBLE RAM buffers — GPU streams only the 8/128 selected rows over PCIe (~34MB/layer vs 340MB upload); host mirror ~17GB one-time, zero churn. This IS the planned tiered design — RAM is the expert tier, no copy needed.
+- Gate: **PASS on GPU path** — all 8 argmax match HF, worst cos 0.9857 (bf16 floor). Perf: **0.62 s/tok** @ ~940 submits/token (vs ~20 s/tok CPU-fallback).
+
+### P2 — speed: bandwidth-bound decode path (weeks 3–6)
+- Wave64 dequant-fused NVFP4 GEMV (v_dot4 unpack, E4M3×fp32 scale epilogue); WMMA prefill GEMMs (wave32); fused norm+act; paged KV fp8 storage path.
+- **Device-resident forward** (P2a, in flight): all activations/caches on device, one recorded submission per token — kills the ~940 submits×0.3ms + ~180ms descriptor-write overhead that dominates the 0.62 s/tok.
+- Expert streaming already via host-visible buffers; remaining: router-lookahead prefetch (L+1 gate on h_L) if PCIe reads become the bound, loop-pass pinning, early-preemption.
+- Prerecorded command buffers per shape; logits→sample small D2H only.
+- Bench harness: tok/s, per-layer timing, hit rates; A/B vs llama.cpp fork baseline (84.9 t/s @128K is the bar).
 
 ### P2 — speed: bandwidth-bound decode path (weeks 3–6)
 - Wave64 dequant-fused NVFP4 GEMV (v_dot4 unpack, E4M3×fp32 scale epilogue); WMMA prefill GEMMs (wave32); fused norm+act; paged KV fp8 storage path.
