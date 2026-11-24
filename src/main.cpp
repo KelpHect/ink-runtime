@@ -14,6 +14,11 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/stat.h>
+#endif
 
 using namespace ink;
 
@@ -21,6 +26,15 @@ using namespace ink;
 static bool dump_f32(const std::string& dir, const char* name, int step,
                      const float* p, size_t n) {
   char path[512];
+  static bool dir_made = false;
+  if (!dir_made) {
+    dir_made = true;
+#ifdef _WIN32
+    CreateDirectoryA(dir.c_str(), nullptr);  // fine if it already exists
+#else
+    mkdir(dir.c_str(), 0755);
+#endif
+  }
   std::snprintf(path, sizeof(path), "%s\\%s_step%d.bin", dir.c_str(), name,
                 step);
   FILE* f = std::fopen(path, "wb");
