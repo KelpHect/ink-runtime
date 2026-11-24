@@ -1,0 +1,274 @@
+{
+  "model_dir": "Inkling-2-Mini",
+  "hf_model_id": "thinkingmachines/Inkling-2-Mini",
+  "model_class": "Inkling2LoopForCausalLM",
+  "model_type": "inkling2_loop_text",
+  "transformers_version": "5.24.0.dev0",
+  "torch_version": "2.15.0+cpu",
+  "dtype": "bfloat16",
+  "attn_implementation": "eager",
+  "seed": 0,
+  "decoding": "manual greedy argmax of post-softcap logits (no sampling)",
+  "prompt": {
+    "user_message": "What is the capital of France? Answer briefly.",
+    "chat_template": "chat_template.jinja via apply_chat_template(add_generation_prompt=True); rendered prefix ends after user <|end_message|> (the {% generation %} block wraps whole assistant turns, so the model emits <|message_model|> itself)",
+    "rendered_text": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is the capital of France? Answer briefly.<|end_message|>",
+    "input_ids": [
+      200002,
+      200004,
+      34182,
+      279,
+      154554,
+      150628,
+      25,
+      220,
+      15,
+      13,
+      24,
+      200010,
+      200000,
+      200004,
+      1775,
+      149884,
+      149876,
+      151451,
+      149879,
+      151194,
+      30,
+      154710,
+      183263,
+      13,
+      200010
+    ]
+  },
+  "generated_ids": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "generated_text": "!!!!!!!!",
+  "eos_token_id": 200006,
+  "steps": [
+    {
+      "step": 0,
+      "input_len": 25,
+      "argmax": 0,
+      "top5_ids": [
+        3,
+        4,
+        1,
+        0,
+        2
+      ],
+      "top5_values": [
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN
+      ],
+      "seconds": 2.3
+    },
+    {
+      "step": 1,
+      "input_len": 1,
+      "argmax": 0,
+      "top5_ids": [
+        3,
+        4,
+        1,
+        0,
+        2
+      ],
+      "top5_values": [
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN
+      ],
+      "seconds": 0.38
+    },
+    {
+      "step": 2,
+      "input_len": 1,
+      "argmax": 0,
+      "top5_ids": [
+        3,
+        4,
+        1,
+        0,
+        2
+      ],
+      "top5_values": [
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN
+      ],
+      "seconds": 0.34
+    },
+    {
+      "step": 3,
+      "input_len": 1,
+      "argmax": 0,
+      "top5_ids": [
+        3,
+        4,
+        1,
+        0,
+        2
+      ],
+      "top5_values": [
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN
+      ],
+      "seconds": 0.36
+    },
+    {
+      "step": 4,
+      "input_len": 1,
+      "argmax": 0,
+      "top5_ids": [
+        3,
+        4,
+        1,
+        0,
+        2
+      ],
+      "top5_values": [
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN
+      ],
+      "seconds": 0.34
+    },
+    {
+      "step": 5,
+      "input_len": 1,
+      "argmax": 0,
+      "top5_ids": [
+        3,
+        4,
+        1,
+        0,
+        2
+      ],
+      "top5_values": [
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN
+      ],
+      "seconds": 0.32
+    },
+    {
+      "step": 6,
+      "input_len": 1,
+      "argmax": 0,
+      "top5_ids": [
+        3,
+        4,
+        1,
+        0,
+        2
+      ],
+      "top5_values": [
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN
+      ],
+      "seconds": 0.38
+    },
+    {
+      "step": 7,
+      "input_len": 1,
+      "argmax": 0,
+      "top5_ids": [
+        3,
+        4,
+        1,
+        0,
+        2
+      ],
+      "top5_values": [
+        NaN,
+        NaN,
+        NaN,
+        NaN,
+        NaN
+      ],
+      "seconds": 0.31
+    }
+  ],
+  "hidden_tap_spec": {
+    "taps": [
+      5,
+      23,
+      41
+    ],
+    "definition": "decoder-layer INPUT hidden_states (the attn-res 'partial'), captured by forward pre-hook on model.layers[i]; fp32. virtual visit index = global decoder-layer call counter: visits 0-5 prelude layers 0-5, 6-17 pass0 layers 6-17, 18-29 pass1 layers 6-17, 30-41 pass2 layers 6-17, 42-47 coda layers 18-23. visit5=layer5 p0, visit23=layer11 p1, visit41=layer17 p2 (matches mtp target_layer_ids {5,23,41}; id 48 = final normed hidden = hidden_final_step*)",
+    "shapes": "step0: [prompt_len, 2304]; steps>=1: [1, 2304]"
+  },
+  "logits_spec": "fp32 [200058] post-softcap logits of last position; unpadded vocab (unembed tail rows already dropped)",
+  "files": [
+    "logits_step0.npy",
+    "hidden_visit5_step0.npy",
+    "hidden_visit23_step0.npy",
+    "hidden_visit41_step0.npy",
+    "hidden_final_step0.npy",
+    "logits_step1.npy",
+    "hidden_visit5_step1.npy",
+    "hidden_visit23_step1.npy",
+    "hidden_visit41_step1.npy",
+    "hidden_final_step1.npy",
+    "logits_step2.npy",
+    "hidden_visit5_step2.npy",
+    "hidden_visit23_step2.npy",
+    "hidden_visit41_step2.npy",
+    "hidden_final_step2.npy",
+    "logits_step3.npy",
+    "hidden_visit5_step3.npy",
+    "hidden_visit23_step3.npy",
+    "hidden_visit41_step3.npy",
+    "hidden_final_step3.npy",
+    "logits_step4.npy",
+    "hidden_visit5_step4.npy",
+    "hidden_visit23_step4.npy",
+    "hidden_visit41_step4.npy",
+    "hidden_final_step4.npy",
+    "logits_step5.npy",
+    "hidden_visit5_step5.npy",
+    "hidden_visit23_step5.npy",
+    "hidden_visit41_step5.npy",
+    "hidden_final_step5.npy",
+    "logits_step6.npy",
+    "hidden_visit5_step6.npy",
+    "hidden_visit23_step6.npy",
+    "hidden_visit41_step6.npy",
+    "hidden_final_step6.npy",
+    "logits_step7.npy",
+    "hidden_visit5_step7.npy",
+    "hidden_visit23_step7.npy",
+    "hidden_visit41_step7.npy",
+    "hidden_final_step7.npy"
+  ],
+  "notes": [
+    "experts dequantized NVFP4/MXFP8->bf16 at load by HF Inkling2LoopDequantizeExperts; expert params offloaded to data/hf_offload/ during inference (accelerate disk offload)",
+    "vision tower and mtp.safetensors not loaded (text-only harness)"
+  ]
+}
