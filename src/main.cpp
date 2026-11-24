@@ -1,5 +1,6 @@
 #include "io/config.h"
 #include "io/safetensors.h"
+#include "io/tokenizer.h"
 #include "model/backend.h"
 #include "model/graph.h"
 #ifdef INK_WITH_VULKAN
@@ -183,10 +184,18 @@ int main(int argc, char** argv) {
     };
   }
 
-  if (!prompt.empty())
-    std::printf("note: BPE tokenizer not wired in this milestone; ignoring "
-                "--prompt, use --token-ids a,b,c\n");
-  if (ids.empty()) ids = {200028};  // <|begin_of_text|>
+  Tokenizer tok;
+  bool tok_loaded = tok.load(dir, &err);
+  if (!prompt.empty()) {
+    if (!tok_loaded) {
+      std::fprintf(stderr, "tokenizer: %s\n", err.c_str());
+      return 1;
+    }
+    ids = tok.encode_chat_user(prompt);
+    std::printf("prompt: %zu tokens\n", ids.size());
+  } else if (ids.empty()) {
+    ids = {200028};  // <|begin_of_text|>
+  }
 
   int64_t pos = 0;
   size_t ip = 0;
@@ -202,15 +211,21 @@ int main(int argc, char** argv) {
   }
   int cur = ops::argmax(g.state().logits.data(),
                         int(g.state().logits.size()));
+  std::vector<int> gen_ids;
   for (int t = 0; t < gen_tokens; t++) {
     cur_step = t + 1;
     const std::vector<float>& logits = g.forward_token(cur, pos++);
     int am = ops::argmax(logits.data(), int(logits.size()));
     float lp = logits[am];
-    std::printf("gen %d: token %d (logit %.3f)\n", t, am, lp);
+    gen_ids.push_back(am);
+    std::string txt = tok_loaded ? tok.decode({am}) : "";
+    std::printf("gen %d: token %d (logit %.3f) %s\n", t, am, lp,
+                txt.c_str());
     if (!dump_dir.empty()) dump_step(dump_dir, g.state(), t + 1);
     if (am == cfg.eos_token_id) break;
     cur = am;
   }
+  if (tok_loaded && !gen_ids.empty())
+    std::printf("text: %s\n", tok.decode(gen_ids).c_str());
   return 0;
 }
