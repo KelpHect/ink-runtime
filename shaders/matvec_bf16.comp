@@ -1,0 +1,50 @@
+#version 460
+
+// matvec_bf16.comp — out[m] = sum_k bf16(W[m,k]) * x[k], W bf16 row-major.
+//
+// Mirrors the DType::BF16 case of ops.cpp::matvec: weights decode via
+// bf16_to_f32 (u16 << 16 reinterpret), x stays fp32, fp32 accumulation.
+// One workgroup (64 threads) per output row: row = m0 + gl_WorkGroupID.x.
+// Dispatch: num_workgroups.x = M (chunk m0 above 65535; unembed M=200058 needs 4).
+//
+// W is read as a u32 array: element k of a row = low/high 16 bits of w[..].
+// REQUIREMENT: K must be even so every row starts on a 4-byte boundary
+// (true for every K here: 2304, 3072, 1024).
+//
+// Uses: wq/wk/wv/wo/gate/sink/wr projections, unembed (M=200058), any bf16 GEMV.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer WBuf { uint w[]; }; // [M,K] bf16 packed 2/u32
+layout(set = 0, binding = 1, std430) readonly buffer XBuf { float x[]; }; // [K] f32
+layout(set = 0, binding = 2, std430) writeonly buffer OBuf { float o[]; }; // [M] f32
+
+layout(push_constant) uniform Pc {
+    uint K;
+    uint m0;
+} pc;
+
+shared float red[64];
+
+float bf16_at(uint elem) {          // elem = global element index into w as u16s
+    uint u = w[elem >> 1] >> ((elem & 1u) * 16u);
+    return uintBitsToFloat((u & 0xFFFFu) << 16);
+}
+
+void main() {
+    const uint m = pc.m0 + gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint base = m * pc.K;   // element index (K even -> u32 aligned)
+
+    float acc = 0.0;
+    for (uint k = tid; k < pc.K; k += 64u)
+        acc += bf16_at(base + k) * x[k];
+
+    red[tid] = acc;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    if (tid == 0u) o[m] = red[0];
+}

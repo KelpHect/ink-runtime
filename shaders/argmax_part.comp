@@ -1,0 +1,51 @@
+#version 460
+
+// argmax_part.comp — stage 1 of two-stage argmax over n fp32 logits.
+//
+// Mirrors ops.cpp::argmax (std::max_element -> FIRST maximum wins).
+// Each workgroup scans a contiguous chunk [gid*chunk, min(n, gid*chunk+chunk));
+// threads stride it, local best kept with STRICT > (earliest index kept);
+// shared pairwise reduce uses "v wins iff v > bv || (v == bv && idx < bidx)"
+// so the earliest index survives every tie, matching max_element.
+// Writes partial (pidx[gid], pval[gid]); argmax_final reduces these.
+// Dispatch: num_workgroups.x = nchunks (e.g. ceil(200058/2048) = 98).
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer XBuf  { float x[]; };   // [n]
+layout(set = 0, binding = 1, std430) writeonly buffer VBuf { float pv[]; };  // [nchunks]
+layout(set = 0, binding = 2, std430) writeonly buffer IBuf { uint  pi[]; };  // [nchunks]
+
+layout(push_constant) uniform Pc {
+    uint n;
+    uint chunk;    // elements per workgroup (host picks; e.g. 2048)
+} pc;
+
+shared float bv[64];
+shared uint  bi[64];
+
+void main() {
+    const uint gid = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint lo = gid * pc.chunk;
+    const uint hi = min(pc.n, lo + pc.chunk);
+
+    float best = -3.402823466e38;   // -FLT_MAX
+    uint  bidx = lo;
+    for (uint i = lo + tid; i < hi; i += 64u) {
+        float v = x[i];
+        if (v > best) { best = v; bidx = i; }   // strict > keeps earliest
+    }
+    bv[tid] = best; bi[tid] = bidx;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if (tid < s) {
+            float ov = bv[tid + s]; uint oi = bi[tid + s];
+            if (ov > bv[tid] || (ov == bv[tid] && oi < bi[tid])) {
+                bv[tid] = ov; bi[tid] = oi;
+            }
+        }
+        barrier();
+    }
+    if (tid == 0u) { pv[gid] = bv[0]; pi[gid] = bi[0]; }
+}

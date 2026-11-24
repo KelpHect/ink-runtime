@@ -1,0 +1,22 @@
+#version 460
+
+// softcap.comp — in-place softcap: l[i] = cap * tanh(l[i] / cap).
+//
+// Mirrors ops.cpp::softcap as applied to the final logits
+// (cap = final_logit_softcapping = 30.0 over 200058 logits).
+// One thread per element, strided. Dispatch: ceil(n/64) workgroups.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) buffer LBuf { float l[]; };  // [n] rw
+
+layout(push_constant) uniform Pc {
+    uint  n;
+    float cap;
+} pc;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    l[i] = pc.cap * tanh(l[i] / pc.cap);
+}

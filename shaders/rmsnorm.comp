@@ -1,0 +1,52 @@
+#version 460
+
+// rmsnorm.comp — RMSNorm over one vector per workgroup.
+//
+// Mirrors ops.cpp::rmsnorm (weighted) and ops.cpp::rmsnorm_uw (unweighted):
+//   rstd = 1/sqrt(mean(x^2) + eps)
+//   out[i] = x[i] * rstd * gamma[i]      (flags bit0 = 1)
+//   out[i] = x[i] * rstd                 (flags bit0 = 0)
+//
+// One workgroup (64 threads) per row: gl_WorkGroupID.x = row index.
+// Buffers hold n_rows * n floats, row-major. Dispatch: num_workgroups.x = n_rows.
+//
+// Uses here: embed_norm application is in embed_norm.comp; per-head V norm is
+// this shader with n = head_dim (128) and flags = 0; sublayer norms use n = 2304.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer XBuf { float x[]; };
+// gamma[n]; when flags bit0 == 0 this is unused — bind any readable >=4-byte buffer.
+layout(set = 0, binding = 1, std430) readonly buffer GBuf { float g[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer OBuf { float o[]; };
+
+layout(push_constant) uniform Pc {
+    uint  n;       // elements per row
+    float eps;     // rms_norm_eps (1e-6 for this model)
+    uint  flags;   // bit0: USE_GAMMA
+} pc;
+
+shared float red[64];
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const uint base = row * pc.n;
+    const uint tid = gl_LocalInvocationID.x;
+
+    float ss = 0.0;
+    for (uint i = tid; i < pc.n; i += 64u) {
+        float v = x[base + i];
+        ss += v * v;
+    }
+    red[tid] = ss;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    const float rstd = 1.0 / sqrt(red[0] / float(pc.n) + pc.eps);
+
+    const bool useg = (pc.flags & 1u) != 0u;
+    for (uint i = tid; i < pc.n; i += 64u)
+        o[base + i] = x[base + i] * rstd * (useg ? g[i] : 1.0);
+}

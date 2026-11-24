@@ -1,0 +1,43 @@
+#version 460
+
+// attn_accum.comp — attention output: out[h,:] = sum_j p[h,j] * v_j.
+//
+// Mirrors the accumulation loop of ops.cpp::attn_step: for each query head h,
+// over j in the window (probabilities from attn_softmax):
+//   o[h*DH + d] = sum_jj p[h*pstride + jj] * v[(j0+jj) * HK*DH + g*DH + d]
+// g = h * HK / HQ (GQA). The sink probability at index n is ignored (zero V).
+// Caller multiplies o by sigmoid(gate) afterwards (sigmoid_mul.comp) and runs
+// the wo matvec.
+//
+// One workgroup (64 threads) per head; threads stride over DH dims, each
+// serially accumulating over the window (correctness-first).
+// Dispatch: num_workgroups.x = HQ.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer PBuf  { float p[]; };  // [HQ*pstride]
+layout(set = 0, binding = 1, std430) readonly buffer VBuf  { float v[]; };  // [len*HK*DH]
+layout(set = 0, binding = 2, std430) writeonly buffer OBuf { float o[]; };  // [HQ*DH]
+
+layout(push_constant) uniform Pc {
+    uint hq;
+    uint hk;
+    uint dh;
+    uint j0;
+    uint n;        // window length = len - j0
+    uint pstride;
+} pc;
+
+void main() {
+    const uint h   = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint g   = h * pc.hk / pc.hq;
+    const uint pb  = h * pc.pstride;
+
+    for (uint d = tid; d < pc.dh; d += 64u) {
+        float acc = 0.0;
+        for (uint jj = 0u; jj < pc.n; jj++)
+            acc += p[pb + jj] * v[(pc.j0 + jj) * (pc.hk * pc.dh) + g * pc.dh + d];
+        o[h * pc.dh + d] = acc;
+    }
+}

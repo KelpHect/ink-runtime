@@ -1,0 +1,85 @@
+#version 460
+
+// msg_gate.comp — rank-64 message gate (loop layers, pass >= 1).
+//
+// Mirrors ops.cpp::msg_gate (incl. matvec_bf16io precision discipline):
+//   rd, rm   = unweighted rstd of dest, msg (eps 1e-6)
+//   cat[k]   = k < D ? dest[k]*rd : msg[k-D]*rm            (2D = 4608)
+//   h[r]     = bf16_round( sum_k bf16(down[r,k]) * bf16_round(cat[k]) )
+//              — inputs AND output rounded through bf16 (07 §3)
+//   out[d]   = (1 - tanh(forget[d,:].h)) * dest[d] + tanh(gain[d,:].h) * msg[d]
+//
+// ONE workgroup (64 threads). down is bf16 [rank, 2D] packed 2/u32;
+// forget/gain are fp32 [D, rank] row-major. rank <= 64 (this model: 64).
+//
+// Buffers: DOWN u32 (bf16 pairs), FORGET f32, GAIN f32, DEST f32, MSG f32, OUT f32.
+// Dispatch: num_workgroups = (1,1,1). Caller applies the sublayer norm after.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer DBuf { uint  dn[]; };  // bf16 [rank,2D]
+layout(set = 0, binding = 1, std430) readonly buffer FBuf { float fw[]; };  // [D,rank]
+layout(set = 0, binding = 2, std430) readonly buffer GBuf { float gw[]; };  // [D,rank]
+layout(set = 0, binding = 3, std430) readonly buffer XBuf { float dst[]; }; // [D]
+layout(set = 0, binding = 4, std430) readonly buffer MBuf { float msg[]; }; // [D]
+layout(set = 0, binding = 5, std430) writeonly buffer OBuf { float o[]; };  // [D]
+
+layout(push_constant) uniform Pc {
+    uint D;      // 2304
+    uint rank;   // 64
+} pc;
+
+shared float red[64];
+shared float h[64];
+shared float rr[2];   // rr[0]=rstd(dest), rr[1]=rstd(msg)
+
+// round fp32 -> bf16 -> fp32 (matches tensor.h f32_to_bf16 + bf16_to_f32, RNE)
+float bf16_round(float f) {
+    uint u = floatBitsToUint(f);
+    u += 0x7FFFu + ((u >> 16) & 1u);
+    return uintBitsToFloat(u & 0xFFFF0000u);
+}
+float bf16_at(uint elem) {  // element index into the packed u16 weight array
+    return uintBitsToFloat(((dn[elem >> 1] >> ((elem & 1u) * 16u)) & 0xFFFFu) << 16);
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+
+    // phase A: rstd of dest and msg (two reductions)
+    float sd = 0.0, sm = 0.0;
+    for (uint i = tid; i < pc.D; i += 64u) {
+        float vd = dst[i], vm = msg[i];
+        sd += vd * vd; sm += vm * vm;
+    }
+    red[tid] = sd; barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) { if (tid < s) red[tid] += red[tid + s]; barrier(); }
+    if (tid == 0u) rr[0] = 1.0 / sqrt(red[0] / float(pc.D) + 1e-6);
+    barrier();
+    red[tid] = sm; barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) { if (tid < s) red[tid] += red[tid + s]; barrier(); }
+    if (tid == 0u) rr[1] = 1.0 / sqrt(red[0] / float(pc.D) + 1e-6);
+    barrier();
+
+    // phase B: h[r] = bf16_round( down[r,:] . bf16(cat) ), one thread per r
+    if (tid < pc.rank) {
+        const uint base = tid * 2u * pc.D;   // element index into dn (2D even -> aligned)
+        float acc = 0.0;
+        for (uint k = 0u; k < 2u * pc.D; k++) {
+            float cv = (k < pc.D) ? dst[k] * rr[0] : msg[k - pc.D] * rr[1];
+            acc += bf16_at(base + k) * bf16_round(cv);
+        }
+        h[tid] = bf16_round(acc);
+    }
+    barrier();
+
+    // phase C: gated mix over D
+    for (uint d = tid; d < pc.D; d += 64u) {
+        float fr = 0.0, gn = 0.0;
+        for (uint r = 0u; r < pc.rank; r++) {
+            fr += fw[d * pc.rank + r] * h[r];
+            gn += gw[d * pc.rank + r] * h[r];
+        }
+        o[d] = (1.0 - tanh(fr)) * dst[d] + tanh(gn) * msg[d];
+    }
+}

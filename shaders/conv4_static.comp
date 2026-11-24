@@ -1,0 +1,54 @@
+#version 460
+
+// conv4_static.comp — causal depthwise conv4 with static taps.
+//
+// Mirrors ops.cpp::sconv4_static (one decode step):
+//   acc[c] = w[c,3]*x[c] + sum_{lag=1..3} w[c,3-lag] * hist[c, lag-1]
+//   (hist[c,i] = x[t-1-i]; entries with lag > filled are 0)
+//   out[c] = (acc[c] + x[c]) * (1/sqrt(5)) = (conv(x) + x) / sqrt(5)
+//
+// Buffers:
+//   W    [C,4] f32 row-major: w[c*4+t] = conv1d weight [C,1,4] flattened;
+//        tap 3 = current token, tap 0 = 3 steps back.
+//   HIST [C,3] f32: h[c*3+i] = x[t-1-i]. May be all-zero when filled == 0.
+//   X    [C] f32 current input; OUT [C] f32. X may alias OUT (each thread reads
+//        its own element once before writing).
+// flags bit0 UPDATE: after computing, shift in x — h[c*3+2]=h[c*3+1],
+//   h[c*3+1]=h[c*3+0], h[c*3+0]=x[c] (keeps the conv state on-device).
+//   When UPDATE is set the host still advances its own `filled` counter
+//   (min(filled+1,3)) for the next dispatch's PC.
+// One thread per channel, strided over C. Dispatch: ceil(C/64) workgroups.
+// C = 1024 (k/v streams) or 2304 (attn-out / mlp-out streams).
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer XBuf  { float x[]; };
+layout(set = 0, binding = 1, std430) readonly buffer WBuf  { float w[]; };
+layout(set = 0, binding = 2, std430) buffer HBuf           { float h[]; };  // in/out state
+layout(set = 0, binding = 3, std430) writeonly buffer OBuf { float o[]; };
+
+layout(push_constant) uniform Pc {
+    uint C;
+    uint filled;   // 0..3 (ConvState4::filled); guards cold-start history
+    uint flags;    // bit0: UPDATE history in place
+} pc;
+
+const float INV_SQRT5 = 0.4472135954999579;
+
+void main() {
+    const uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.C) return;
+
+    const float xv = x[c];
+    float acc = w[c * 4u + 3u] * xv;                          // tap 3 = current
+    if (pc.filled > 0u) acc += w[c * 4u + 2u] * h[c * 3u + 0u]; // lag 1 -> x[t-1]
+    if (pc.filled > 1u) acc += w[c * 4u + 1u] * h[c * 3u + 1u]; // lag 2 -> x[t-2]
+    if (pc.filled > 2u) acc += w[c * 4u + 0u] * h[c * 3u + 2u]; // lag 3 -> x[t-3]
+    o[c] = (acc + xv) * INV_SQRT5;
+
+    if ((pc.flags & 1u) != 0u) {
+        h[c * 3u + 2u] = h[c * 3u + 1u];
+        h[c * 3u + 1u] = h[c * 3u + 0u];
+        h[c * 3u + 0u] = xv;
+    }
+}

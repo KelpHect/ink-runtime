@@ -1,0 +1,54 @@
+#version 460
+
+// matvec_f8e4m3.comp — out[m] = sum_k f8e4m3(W[m,k]) * x[k], W u8 row-major.
+//
+// Mirrors the DType::F8E4M3 case of ops.cpp::matvec (decode = tensor.h
+// f8e4m3_to_f32, the "fn" variant: exp==0 -> subnormal m/8 * 2^-6, else
+// (1+m/8)*2^(e-7); sign bit; no inf). fp32 accumulation.
+// One workgroup per output row: row = m0 + gl_WorkGroupID.x.
+//
+// W is read as a u32 array: element k = byte k of the row.
+// REQUIREMENT: K % 4 == 0 so every row starts on a 4-byte boundary.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer WBuf { uint w[]; }; // [M,K] u8 packed 4/u32
+layout(set = 0, binding = 1, std430) readonly buffer XBuf { float x[]; }; // [K] f32
+layout(set = 0, binding = 2, std430) writeonly buffer OBuf { float o[]; }; // [M] f32
+
+layout(push_constant) uniform Pc {
+    uint K;
+    uint m0;
+} pc;
+
+shared float red[64];
+
+float f8e4m3_to_f32(uint v) {       // v = one byte
+    uint s = v >> 7, e = (v >> 3) & 0xFu, m = v & 7u;
+    float x = (e == 0u) ? ldexp(float(m) / 8.0, -6)
+                        : ldexp(1.0 + float(m) / 8.0, int(e) - 7);
+    return s != 0u ? -x : x;
+}
+
+float w_at(uint elem) {             // elem = global element index into w as bytes
+    uint b = (w[elem >> 2] >> ((elem & 3u) * 8u)) & 0xFFu;
+    return f8e4m3_to_f32(b);
+}
+
+void main() {
+    const uint m = pc.m0 + gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint base = m * pc.K;   // byte index (K%4==0 -> u32 aligned)
+
+    float acc = 0.0;
+    for (uint k = tid; k < pc.K; k += 64u)
+        acc += w_at(base + k) * x[k];
+
+    red[tid] = acc;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    if (tid == 0u) o[m] = red[0];
+}

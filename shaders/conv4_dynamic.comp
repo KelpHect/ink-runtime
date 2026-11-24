@@ -1,0 +1,54 @@
+#version 460
+
+// conv4_dynamic.comp — causal depthwise conv4 with input-conditioned taps.
+//
+// Mirrors ops.cpp::sconv4_dynamic (full-attention layers 5,11,17,23, k/v only):
+//   h      = c / head_dim                      (the kv-head of channel c)
+//   tap(lag,c) = static_w[lag, c] + dyn[h*4+lag]     lag 0 = CURRENT token
+//   acc[c] = sum_{lag=0..3} tap(lag,c) * x_in(lag)
+//   out[c] = (acc[c] + x[c]) * (1/3) = (conv(x)+x)/sqrt(2*4+1)
+//
+// Buffers:
+//   SW  [4,C] f32: sw[lag*C + c] = static_w[lag,c] (checkpoint layout [4,1024]).
+//   DYN [H*4] f32: per-token dynamic taps from the sublayer INPUT projection
+//       (kconv_wproj/vconv_wproj output, H = C/head_dim = 8 heads -> [32]).
+//   HIST [C,3] f32 as in conv4_static. X [C], OUT [C] (may alias).
+// flags bit0 UPDATE shifts hist (same as conv4_static).
+// Dispatch: ceil(C/64) workgroups, C = 1024, head_dim = 128.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer XBuf  { float x[]; };
+layout(set = 0, binding = 1, std430) readonly buffer SBuf  { float sw[]; };
+layout(set = 0, binding = 2, std430) readonly buffer DBuf  { float dyn[]; };
+layout(set = 0, binding = 3, std430) buffer HBuf           { float hs[]; };
+layout(set = 0, binding = 4, std430) writeonly buffer OBuf { float o[]; };
+
+layout(push_constant) uniform Pc {
+    uint C;
+    uint head_dim;
+    uint filled;
+    uint flags;    // bit0: UPDATE history
+} pc;
+
+const float INV3 = 0.3333333333333333;
+
+void main() {
+    const uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.C) return;
+
+    const uint hh = (c / pc.head_dim) * 4u;   // dyn base for this channel's head
+    const float xv = x[c];
+
+    float acc = (sw[0u * pc.C + c] + dyn[hh + 0u]) * xv;                    // lag 0 = current
+    if (pc.filled > 0u) acc += (sw[1u * pc.C + c] + dyn[hh + 1u]) * hs[c * 3u + 0u];
+    if (pc.filled > 1u) acc += (sw[2u * pc.C + c] + dyn[hh + 2u]) * hs[c * 3u + 1u];
+    if (pc.filled > 2u) acc += (sw[3u * pc.C + c] + dyn[hh + 3u]) * hs[c * 3u + 2u];
+    o[c] = (acc + xv) * INV3;
+
+    if ((pc.flags & 1u) != 0u) {
+        hs[c * 3u + 2u] = hs[c * 3u + 1u];
+        hs[c * 3u + 1u] = hs[c * 3u + 0u];
+        hs[c * 3u + 0u] = xv;
+    }
+}

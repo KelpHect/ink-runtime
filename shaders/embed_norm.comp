@@ -1,0 +1,48 @@
+#version 460
+
+// embed_norm.comp — embedding gather + RMSNorm: out = rmsnorm(embed[token]).
+//
+// Mirrors graph.cpp::forward_token's embed step:
+//   e[d] = decode(embed[token, d])     (BF16 or F32 row — flags bit0)
+//   out[d] = e[d] * (1/sqrt(mean(e^2)+eps)) * gamma[d]
+//
+// ONE workgroup (64 threads), n = hidden = 2304.
+// EMB is read as a u32 array: F32 elements are raw float bits; BF16 elements
+// are 2-per-u32 halves (n must be even for BF16 row alignment — 2304 is).
+// flags bit0 = 1: embed row is BF16; = 0: F32.
+// Dispatch: num_workgroups = (1,1,1).
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer EBuf { uint  e[]; }; // [V,n] packed
+layout(set = 0, binding = 1, std430) readonly buffer GBuf { float g[]; }; // [n] gamma
+layout(set = 0, binding = 2, std430) writeonly buffer OBuf { float o[]; };// [n]
+
+layout(push_constant) uniform Pc {
+    uint  token;
+    uint  n;
+    float eps;
+    uint  flags;   // bit0: SRC_BF16
+} pc;
+
+shared float red[64];
+shared float rstd;
+
+float emb_at(uint d) {   // element d of row `token`
+    if ((pc.flags & 1u) != 0u) {
+        uint idx = pc.token * pc.n + d;               // u16 element index
+        return uintBitsToFloat(((e[idx >> 1] >> ((idx & 1u) * 16u)) & 0xFFFFu) << 16);
+    }
+    return uintBitsToFloat(e[pc.token * pc.n + d]);   // f32 bit pattern
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    float ss = 0.0;
+    for (uint d = tid; d < pc.n; d += 64u) { float v = emb_at(d); ss += v * v; }
+    red[tid] = ss; barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) { if (tid < s) red[tid] += red[tid + s]; barrier(); }
+    if (tid == 0u) rstd = 1.0 / sqrt(red[0] / float(pc.n) + pc.eps);
+    barrier();
+    for (uint d = tid; d < pc.n; d += 64u) o[d] = emb_at(d) * rstd * g[d];
+}

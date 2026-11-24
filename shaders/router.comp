@@ -1,0 +1,70 @@
+#version 460
+
+// router.comp — MoE router: sigmoid scores + bias-selected top-k.
+//
+// Mirrors ops.cpp::router_topk exactly:
+//   logits[i] = gate_w[i,:] . x        (fp32)
+//   score[i]  = sigmoid(logits[i])
+//   sel[i]    = score[i] + gate_b[i]   (bias participates ONLY in selection)
+//   keep the k largest sel -> idx[]; w[] = raw score[] of the winners
+//   w[i] = w[i] / (sum(w) + 1e-20) * route_scale
+//
+// One workgroup of 128 threads, one thread per expert (n_experts <= 128).
+// Selection = per-thread rank count: rank(e) = #{j : sel_j > sel_e ||
+//   (sel_j == sel_e && j < e)} — deterministic; index tie-break matches the
+// "first max" spirit of a stable order (CPU partial_sort's tie order is
+// unspecified, so any consistent rule is a valid mirror).
+//
+// Dispatch: num_workgroups = (1,1,1).
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer GWBuf { float gw[]; }; // [E,K] f32
+layout(set = 0, binding = 1, std430) readonly buffer GBBuf { float gb[]; }; // [E] f32
+layout(set = 0, binding = 2, std430) readonly buffer XBuf  { float x[]; };  // [K] f32
+layout(set = 0, binding = 3, std430) writeonly buffer IBuf { int  idx[]; }; // [k]
+layout(set = 0, binding = 4, std430) buffer WBuf           { float w[]; };  // [k]
+
+layout(push_constant) uniform Pc {
+    uint  n_experts;    // 128
+    uint  k;            // 8
+    uint  K;            // 2304 (router gate_w K = hidden)
+    float route_scale;  // 8.0
+} pc;
+
+shared float sel[128];
+shared float scr[128];
+
+void main() {
+    const uint e = gl_LocalInvocationID.x;
+
+    if (e < pc.n_experts) {
+        float acc = 0.0;
+        const uint base = e * pc.K;
+        for (uint j = 0u; j < pc.K; j++) acc += gw[base + j] * x[j];
+        float sc = 1.0 / (1.0 + exp(-acc));      // sigmoid
+        scr[e] = sc;
+        sel[e] = sc + gb[e];
+    }
+    barrier();
+
+    if (e < pc.n_experts) {
+        const float se = sel[e];
+        uint rank = 0u;
+        for (uint j = 0u; j < pc.n_experts; j++) {
+            float sj = sel[j];
+            if (sj > se || (sj == se && j < e)) rank++;
+        }
+        if (rank < pc.k) {
+            idx[rank] = int(e);
+            w[rank] = scr[e];                    // RAW score, not sel
+        }
+    }
+    barrier();
+
+    if (gl_LocalInvocationID.x == 0u) {
+        float sum = 0.0;
+        for (uint i = 0u; i < pc.k; i++) sum += w[i];
+        for (uint i = 0u; i < pc.k; i++) w[i] = w[i] / (sum + 1e-20) * pc.route_scale;
+    }
+}

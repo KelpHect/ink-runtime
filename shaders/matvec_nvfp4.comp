@@ -1,0 +1,87 @@
+#version 460
+
+// matvec_nvfp4.comp — expert GEMV over NVFP4-packed weights.
+//
+// Mirrors ops.cpp::expert_dot (mxfp8 == false path), used per selected expert:
+//   acc = sum_k E2M1(W[e,r,k]) * F8E4M3(S[e,r,k/16]) * x[k]   (fp32)
+//   res = acc * (amax[e] / osd[0])                           (factor LAST)
+//
+// Storage (weight_block_shape [1,16]):
+//   W : u8, 2 E2M1 codes/byte, LOW nibble = even element.
+//       Logical [E,R,K] values = [E,R,K/2] bytes; u32 view: (e*R+r)*(K/8) words.
+//   S : u8 F8E4M3, one scale per 16 values: [E,R,K/16] bytes;
+//       u32 view: (e*R+r)*(K/64) words.  => REQUIRE K % 64 == 0.
+//   amax: f32[E]; osd: f32[1] (outer_scale_denominator).
+//
+// One workgroup (64 threads) per output element m:
+//   row r = row0 + m * row_stride.  For w13 the (gate,up) pairs are interleaved
+//   along dim 1 (row 2m = gate_m, row 2m+1 = up_m): de-interleave with
+//   row_stride=2, row0 in {0,1}. For w2 use row0=0, row_stride=1.
+//
+// flags bit0 ACCUMULATE: o[m] = wscale*res (clear) / o[m] += wscale*res (set).
+// (wscale lets the host fold the router weight w_i into a down-proj accumulate.)
+// Dispatch: num_workgroups.x = M.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer WBuf  { uint  w[]; };
+layout(set = 0, binding = 1, std430) readonly buffer SBuf  { uint  s[]; };
+layout(set = 0, binding = 2, std430) readonly buffer ABuf  { float amax[]; };  // [E]
+layout(set = 0, binding = 3, std430) readonly buffer OBuf  { float osd[]; };   // [1]
+layout(set = 0, binding = 4, std430) readonly buffer XBuf  { float x[]; };     // [K]
+layout(set = 0, binding = 5, std430) buffer OBuf2          { float o[]; };     // [M]
+
+layout(push_constant) uniform Pc {
+    uint  e;           // expert index
+    uint  R;           // total rows of W per expert (shape dim 1)
+    uint  K;           // logical elements per row (must be % 64 == 0)
+    uint  row0;        // first row for m=0
+    uint  row_stride;  // row step per m (1 or 2)
+    float wscale;      // multiplies the result (router weight, or 1.0)
+    uint  flags;       // bit0: ACCUMULATE
+} pc;
+
+shared float red[64];
+
+const float E2M1[16] = float[16](0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                                 -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0);
+
+float f8e4m3_to_f32(uint v) {
+    uint sgn = v >> 7, ex = (v >> 3) & 0xFu, mn = v & 7u;
+    float x = (ex == 0u) ? ldexp(float(mn) / 8.0, -6)
+                         : ldexp(1.0 + float(mn) / 8.0, int(ex) - 7);
+    return sgn != 0u ? -x : x;
+}
+
+void main() {
+    const uint m = gl_WorkGroupID.x;
+    const uint r = pc.row0 + m * pc.row_stride;
+    const uint tid = gl_LocalInvocationID.x;
+
+    const uint wr_base = (pc.e * pc.R + r) * (pc.K >> 3);  // u32 index into w
+    const uint sc_base = (pc.e * pc.R + r) * (pc.K >> 6);  // u32 index into s
+
+    float acc = 0.0;
+    for (uint k = tid; k < pc.K; k += 64u) {
+        // element k -> byte k>>1 -> u32 k>>3, byte lane (k>>1)&3
+        uint word = w[wr_base + (k >> 3)];
+        uint bytev = (word >> (((k >> 1) & 3u) * 8u)) & 0xFFu;
+        uint nib = (k & 1u) != 0u ? (bytev >> 4) : (bytev & 0xFu);
+        // scale byte index k>>4 -> u32 (k>>4)>>2, byte lane (k>>4)&3
+        uint sw = s[sc_base + (k >> 6)];
+        float bs = f8e4m3_to_f32((sw >> (((k >> 4) & 3u) * 8u)) & 0xFFu);
+        acc += E2M1[nib] * bs * x[k];
+    }
+
+    red[tid] = acc;
+    barrier();
+    for (uint st = 32u; st > 0u; st >>= 1) {
+        if (tid < st) red[tid] += red[tid + st];
+        barrier();
+    }
+    if (tid == 0u) {
+        float res = red[0] * (amax[pc.e] / osd[0]);   // per-expert factor, applied last
+        if ((pc.flags & 1u) != 0u) o[m] += pc.wscale * res;
+        else                       o[m] = pc.wscale * res;
+    }
+}

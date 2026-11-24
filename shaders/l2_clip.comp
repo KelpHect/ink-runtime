@@ -1,0 +1,44 @@
+#version 460
+
+// l2_clip.comp — per-head L2 norm clip, optionally with a learned pre-scale.
+//
+// Mirrors ops.cpp::l2_clip (flags bit0 = 0) and ops.cpp::scaled_l2_clip (= 1):
+//   if scaled: v[h,d] *= scale[h,d]  (first!)
+//   n = ||v[h,:]||;  s = min(1, thr / (n + 1e-6));  v[h,:] *= s
+// All fp32. One workgroup (64 threads) per head; threads stride over dim.
+// Dispatch: num_workgroups.x = heads.
+//
+// Uses: q (scaled, thr=qk_l2_clip_threshold=22.627417, dim=128),
+//       k (plain,  same thr,  dim=128),
+//       r (scaled, thr=rel_l2_clip_threshold=8.0, dim=16).
+// When flags bit0 == 0 bind any >=4-byte readable buffer as SCALE (unused).
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) buffer VBuf           { float v[]; }; // [heads*dim]
+layout(set = 0, binding = 1, std430) readonly buffer SBuf  { float sc[]; }; // [heads*dim]
+
+layout(push_constant) uniform Pc {
+    uint  dim;
+    float thr;
+    uint  flags;   // bit0: USE_SCALE
+} pc;
+
+shared float red[64];
+
+void main() {
+    const uint h   = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint base = h * pc.dim;
+
+    if ((pc.flags & 1u) != 0u) {
+        for (uint d = tid; d < pc.dim; d += 64u) v[base + d] *= sc[base + d];
+        barrier();
+    }
+    float ss = 0.0;
+    for (uint d = tid; d < pc.dim; d += 64u) { float x = v[base + d]; ss += x * x; }
+    red[tid] = ss; barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) { if (tid < s) red[tid] += red[tid + s]; barrier(); }
+    const float scl = min(1.0, pc.thr / (sqrt(red[0]) + 1e-6));
+    for (uint d = tid; d < pc.dim; d += 64u) v[base + d] *= scl;
+}

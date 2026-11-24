@@ -1,0 +1,73 @@
+#version 460
+
+// matvec_mxfp8.comp — expert GEMV over MXFP8 weights (layers 20-23).
+//
+// Mirrors ops.cpp::expert_dot (mxfp8 == true path):
+//   acc = sum_k F8E4M3(W[e,r,k]) * UE8M0(S[e,r,k/32]) * x[k]   (fp32)
+//   (no per-expert amax factor — MXFP8 scales are powers of two)
+//
+// Storage (weight_block_shape [32,32], row-major per-row 32-group scales):
+//   W : u8 F8E4M3 values [E,R,K]; u32 view: (e*R+r)*(K/4) words. K % 4 == 0.
+//   S : u8 UE8M0 per 32 values [E,R,K/32]; u32 view: (e*R+r)*(K/128) words.
+//       REQUIRE K % 128 == 0 for u32-aligned scale rows.
+//   Scale decode: 2^(byte-127) = ldexp(1, b-127); byte 0xFF is NaN (unused).
+//
+// One workgroup (64 threads) per output element m:
+//   row r = row0 + m * row_stride (w13 de-interleave: stride 2, row0 in {0,1}).
+// flags bit0 ACCUMULATE: o[m] += wscale*acc else o[m] = wscale*acc.
+// Dispatch: num_workgroups.x = M.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer WBuf { uint  w[]; };
+layout(set = 0, binding = 1, std430) readonly buffer SBuf { uint  s[]; };
+layout(set = 0, binding = 2, std430) readonly buffer XBuf { float x[]; };  // [K]
+layout(set = 0, binding = 3, std430) buffer OBuf          { float o[]; };  // [M]
+
+layout(push_constant) uniform Pc {
+    uint  e;
+    uint  R;
+    uint  K;           // must be % 128 == 0
+    uint  row0;
+    uint  row_stride;
+    float wscale;
+    uint  flags;       // bit0: ACCUMULATE
+} pc;
+
+shared float red[64];
+
+float f8e4m3_to_f32(uint v) {
+    uint sgn = v >> 7, ex = (v >> 3) & 0xFu, mn = v & 7u;
+    float x = (ex == 0u) ? ldexp(float(mn) / 8.0, -6)
+                         : ldexp(1.0 + float(mn) / 8.0, int(ex) - 7);
+    return sgn != 0u ? -x : x;
+}
+
+void main() {
+    const uint m = gl_WorkGroupID.x;
+    const uint r = pc.row0 + m * pc.row_stride;
+    const uint tid = gl_LocalInvocationID.x;
+
+    const uint wr_base = (pc.e * pc.R + r) * (pc.K >> 2);   // u32 into w
+    const uint sc_base = (pc.e * pc.R + r) * (pc.K >> 7);   // u32 into s
+
+    float acc = 0.0;
+    for (uint k = tid; k < pc.K; k += 64u) {
+        uint word = w[wr_base + (k >> 2)];
+        float wv = f8e4m3_to_f32((word >> ((k & 3u) * 8u)) & 0xFFu);
+        uint sw = s[sc_base + (k >> 7)];
+        float bs = ldexp(1.0, int((sw >> (((k >> 5) & 3u) * 8u)) & 0xFFu) - 127);
+        acc += wv * bs * x[k];
+    }
+
+    red[tid] = acc;
+    barrier();
+    for (uint st = 32u; st > 0u; st >>= 1) {
+        if (tid < st) red[tid] += red[tid + st];
+        barrier();
+    }
+    if (tid == 0u) {
+        if ((pc.flags & 1u) != 0u) o[m] += pc.wscale * red[0];
+        else                       o[m] = pc.wscale * red[0];
+    }
+}

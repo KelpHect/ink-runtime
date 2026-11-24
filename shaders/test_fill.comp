@@ -1,0 +1,17 @@
+// Smoke-test kernel: fill a uint buffer with a push-constant pattern.
+// Writes pc.value into dst.data[gl_GlobalInvocationID.x] while < pc.n.
+#version 460
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Dst { uint data[]; } dst;
+
+layout(push_constant) uniform PC {
+  uint n;
+  uint value;
+} pc;
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i < pc.n) dst.data[i] = pc.value;
+}

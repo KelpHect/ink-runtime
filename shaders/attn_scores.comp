@@ -1,0 +1,56 @@
+#version 460
+
+// attn_scores.comp — raw attention logits over the KV window (pre-softmax).
+//
+// Mirrors the score loop of ops.cpp::attn_step:
+//   s_j = dot(q_h, k_j) / sqrt(DH) + (0 <= d < ext ? rel[h*ext+d] : 0), d = pos-j
+// for j in [j0, len). Written to P[h*pstride + (j-j0)]. The sink logit is NOT
+// written here — attn_softmax folds it in during normalization.
+//
+// grid.x = HQ (query head), grid.y = ceil(n/64) 64-wide position blocks;
+// each thread computes ONE score with a serial DH-dot (correctness-first).
+// GQA: kv head g = h * HK / HQ. K layout: k[j * (HK*DH) + g*DH + d].
+//
+// Buffers: Q [HQ*DH] (post clip + log-scale), K [len * HK*DH] (post conv+clip),
+//   REL [HQ*ext] (from rel_bias.comp), P [HQ*pstride] f32 out.
+// PC: n = len - j0 supplied by host (window length), also pstride >= n+1 so
+//   attn_softmax may append the sink probability at index n.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer QBuf  { float q[]; };
+layout(set = 0, binding = 1, std430) readonly buffer KBuf  { float k[]; };
+layout(set = 0, binding = 2, std430) readonly buffer RLBuf { float rel[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer PBuf { float p[]; };
+
+layout(push_constant) uniform Pc {
+    uint hq;      // query heads (24)
+    uint hk;      // kv heads (8)
+    uint dh;      // head_dim (128)
+    uint j0;      // window start (len-window for sliding, 0 for full)
+    uint n;       // window length = len - j0
+    uint pos;     // absolute query position (cache index of current token)
+    uint ext;     // rel_extent (1024)
+    uint pstride; // row stride of p (>= n+1)
+} pc;
+
+void main() {
+    const uint h  = gl_WorkGroupID.x;
+    const uint jj = gl_WorkGroupID.y * 64u + gl_LocalInvocationID.x;  // window offset
+    if (jj >= pc.n) return;
+
+    const uint j  = pc.j0 + jj;
+    const uint g  = h * pc.hk / pc.hq;
+    const float scale = 1.0 / sqrt(float(pc.dh));
+
+    const uint qb = h * pc.dh;
+    const uint kb = j * (pc.hk * pc.dh) + g * pc.dh;
+    float s = 0.0;
+    for (uint d = 0u; d < pc.dh; d++) s += q[qb + d] * k[kb + d];
+    s *= scale;
+
+    const int dd = int(pc.pos) - int(j);
+    if (dd >= 0 && dd < int(pc.ext)) s += rel[h * pc.ext + uint(dd)];
+
+    p[h * pc.pstride + jj] = s;
+}

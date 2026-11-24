@@ -1,0 +1,92 @@
+#version 460
+
+// attn_res.comp — the learned softmax read (attn-residual "block attention").
+//
+// Mirrors ops.cpp::attn_res_read:
+//   xn_s = src_s * rstd_s,  rstd_s = 1/sqrt(mean(src_s^2) + 1e-6)   (unweighted)
+//   logits_s = (q . xn_s) / sqrt(D)
+//   p = softmax(logits)  over the N sources
+//   out[q] = sum_s p_s * xn_s = sum_s (p_s * rstd_s) * src_s
+// The rstd_s scalar factoring avoids materializing xn (mathematically exact).
+//
+// ONE workgroup (64 threads) handles ALL Q queries sequentially:
+//   phase A: rstd per source (N reductions over D)
+//   phase B: per query — N dot-reductions, softmax by thread 0, then the
+//            elementwise weighted sum over D.
+// Host packs sources contiguously: SRC [N, D] (block_states ++ {partial}).
+// N <= 16, Q <= 4 covers every use (attn reads Q in {1,3}, mlp 1, messages 4).
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer SBuf { float src[]; }; // [N*D]
+layout(set = 0, binding = 1, std430) readonly buffer QBuf { float q[]; };   // [Q*D]
+layout(set = 0, binding = 2, std430) writeonly buffer OBuf { float o[]; };  // [Q*D]
+
+layout(push_constant) uniform Pc {
+    uint N;   // number of sources (block_states + 1 for partial)
+    uint D;   // vector dim (2304)
+    uint Q;   // number of queries (1, 3, or 4)
+} pc;
+
+shared float red[64];
+shared float rstd[16];
+shared float prob[16];
+
+// all-thread sum reduce; result in red[0]; leaves a barrier at exit.
+float wg_sum(float v) {
+    barrier();
+    red[gl_LocalInvocationID.x] = v;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if (gl_LocalInvocationID.x < s)
+            red[gl_LocalInvocationID.x] += red[gl_LocalInvocationID.x + s];
+        barrier();
+    }
+    return red[0];
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const float scale = 1.0 / sqrt(float(pc.D));
+
+    // phase A: per-source rms reciprocal std (eps 1e-6, matches attn_res_read)
+    for (uint s = 0u; s < pc.N; s++) {
+        float ss = 0.0;
+        for (uint d = tid; d < pc.D; d += 64u) {
+            float v = src[s * pc.D + d];
+            ss += v * v;
+        }
+        float tot = wg_sum(ss);
+        if (tid == 0u) rstd[s] = 1.0 / sqrt(tot / float(pc.D) + 1e-6);
+    }
+    barrier();
+
+    for (uint qi = 0u; qi < pc.Q; qi++) {
+        const uint qb = qi * pc.D;
+        // logits
+        for (uint s = 0u; s < pc.N; s++) {
+            float acc = 0.0;
+            for (uint d = tid; d < pc.D; d += 64u)
+                acc += q[qb + d] * src[s * pc.D + d];
+            float tot = wg_sum(acc);
+            if (tid == 0u) prob[s] = tot * rstd[s] * scale;   // logits in prob[]
+        }
+        // softmax over N by thread 0 (max-subtracted, matches ops::softmax)
+        if (tid == 0u) {
+            float m = prob[0];
+            for (uint s = 1u; s < pc.N; s++) m = max(m, prob[s]);
+            float z = 0.0;
+            for (uint s = 0u; s < pc.N; s++) { prob[s] = exp(prob[s] - m); z += prob[s]; }
+            for (uint s = 0u; s < pc.N; s++) prob[s] /= z;
+        }
+        barrier();
+        // out[q] = sum_s p_s * rstd_s * src_s
+        for (uint d = tid; d < pc.D; d += 64u) {
+            float acc = 0.0;
+            for (uint s = 0u; s < pc.N; s++)
+                acc += prob[s] * rstd[s] * src[s * pc.D + d];
+            o[qb + d] = acc;
+        }
+        barrier();
+    }
+}

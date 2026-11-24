@@ -1,0 +1,58 @@
+#version 460
+
+// attn_softmax.comp — softmax over the KV window PLUS the per-head sink logit.
+//
+// Mirrors the softmax of ops.cpp::attn_step: the sink is an extra softmax
+// column with ZERO value — it participates in the max and the denominator,
+// then is dropped from the output (its probability is stored at index n for
+// debugging; attn_accum ignores it).
+//   m = max(max_j s_j, sink[h]);  Z = sum_j exp(s_j - m) + exp(sink - m)
+//   p[h][j] = exp(s_j - m) / Z     (in place over the raw scores)
+//   p[h][n] = exp(sink - m) / Z
+//
+// One workgroup (64 threads) per head: grid.x = HQ. n = len - j0 supplied by
+// host. Scores were written by attn_scores into P[h*pstride + 0..n-1].
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) buffer PBuf            { float p[]; };
+layout(set = 0, binding = 1, std430) readonly buffer SKBuf  { float sink[]; }; // [HQ]
+
+layout(push_constant) uniform Pc {
+    uint n;        // window length = len - j0
+    uint pstride;
+} pc;
+
+shared float red[64];
+
+void main() {
+    const uint h   = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint base = h * pc.pstride;
+    const float sk = sink[h];
+
+    // max over window AND the sink
+    float mx = sk;
+    for (uint j = tid; j < pc.n; j += 64u) mx = max(mx, p[base + j]);
+    red[tid] = mx; barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if (tid < s) red[tid] = max(red[tid], red[tid + s]);
+        barrier();
+    }
+    const float m = red[0];
+    barrier();
+
+    // sum of exp over window + sink
+    float es = 0.0;
+    for (uint j = tid; j < pc.n; j += 64u) es += exp(p[base + j] - m);
+    red[tid] = es; barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    const float z = red[0] + exp(sk - m);
+
+    // normalize in place; sink prob appended at index n
+    for (uint j = tid; j < pc.n; j += 64u) p[base + j] = exp(p[base + j] - m) / z;
+    if (tid == 0u) p[base + pc.n] = exp(sk - m) / z;
+}

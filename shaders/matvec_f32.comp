@@ -1,0 +1,41 @@
+#version 460
+
+// matvec_f32.comp — out[m] = sum_k W[m,k] * x[k], W fp32 row-major.
+//
+// Mirrors the DType::F32 case of ops.cpp::matvec. fp32 accumulation.
+// One workgroup (64 threads) per output element: row = m0 + gl_WorkGroupID.x.
+// Dispatch: num_workgroups.x = M (<= 65535; chunk m0 for larger M).
+//
+// Uses: router-independent fp32 GEMVs (e.g. forget/gain inside msg_gate have
+// their own fused path), projections already materialized fp32.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer WBuf { float w[]; }; // [R,K] f32
+layout(set = 0, binding = 1, std430) readonly buffer XBuf { float x[]; }; // [K] f32
+layout(set = 0, binding = 2, std430) writeonly buffer OBuf { float o[]; }; // [M] f32
+
+layout(push_constant) uniform Pc {
+    uint K;    // inner dim (must equal W's row length)
+    uint m0;   // output row base added to gl_WorkGroupID.x (chunking for M > 65535)
+} pc;
+
+shared float red[64];
+
+void main() {
+    const uint m = pc.m0 + gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint base = m * pc.K;
+
+    float acc = 0.0;
+    for (uint k = tid; k < pc.K; k += 64u)
+        acc += w[base + k] * x[k];
+
+    red[tid] = acc;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    if (tid == 0u) o[m] = red[0];
+}

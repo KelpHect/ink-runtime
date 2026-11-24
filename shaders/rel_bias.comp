@@ -1,0 +1,35 @@
+#version 460
+
+// rel_bias.comp — per-head relative-position bias profiles.
+//
+// Mirrors the rel-bias block of ops.cpp::attn_step:
+//   rel[h*ext + d] = sum_{e<DR} r[h*DR + e] * proj[e*ext + d]
+// where r = clipped (+log-scaled) per-head relative states [HQ*DR] and
+// proj = rel_logits_proj [DR=16, ext=1024]. rel is then gathered as
+// rel[h][pos-j] inside attn_scores (d = pos-j valid only for 0 <= d < ext).
+//
+// One thread per output element. Dispatch: ceil(HQ*ext/64) workgroups.
+// HQ=24, DR=16, ext=1024 -> 24576 elements.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer RBuf   { float r[]; };   // [HQ*DR]
+layout(set = 0, binding = 1, std430) readonly buffer PJBuf  { float proj[]; };// [DR*ext]
+layout(set = 0, binding = 2, std430) writeonly buffer RLBuf { float rel[]; }; // [HQ*ext]
+
+layout(push_constant) uniform Pc {
+    uint dr;    // d_rel = 16
+    uint ext;   // rel_extent = 1024
+    uint n;     // total outputs = HQ * ext
+} pc;
+
+void main() {
+    const uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.n) return;
+    const uint h = gid / pc.ext;
+    const uint d = gid % pc.ext;
+    float acc = 0.0;
+    for (uint e = 0u; e < pc.dr; e++)
+        acc += r[h * pc.dr + e] * proj[e * pc.ext + d];
+    rel[gid] = acc;
+}

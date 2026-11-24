@@ -1,0 +1,42 @@
+#version 460
+
+// argmax_final.comp — stage 2: reduce the per-chunk argmax partials.
+//
+// Consumes (pv, pi) from argmax_part with the same earliest-index-wins tie
+// rule (partials arrive in ascending chunk order and within a chunk the
+// earliest index was kept, so this reproduces std::max_element exactly).
+// ONE workgroup (64 threads). res[0] = argmax index (uint).
+// Dispatch: num_workgroups = (1,1,1).
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer VBuf  { float pv[]; }; // [P]
+layout(set = 0, binding = 1, std430) readonly buffer IBuf  { uint  pi[]; }; // [P]
+layout(set = 0, binding = 2, std430) writeonly buffer RBuf { uint  res[]; };// [1]
+
+layout(push_constant) uniform Pc { uint p; } pc;
+
+shared float bv[64];
+shared uint  bi[64];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    float best = -3.402823466e38;
+    uint  bidx = 0xFFFFFFFFu;   // any real index wins the first tie
+    for (uint i = tid; i < pc.p; i += 64u) {
+        float v = pv[i];
+        if (v > best || (v == best && pi[i] < bidx)) { best = v; bidx = pi[i]; }
+    }
+    bv[tid] = best; bi[tid] = bidx;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if (tid < s) {
+            float ov = bv[tid + s]; uint oi = bi[tid + s];
+            if (ov > bv[tid] || (ov == bv[tid] && oi < bi[tid])) {
+                bv[tid] = ov; bi[tid] = oi;
+            }
+        }
+        barrier();
+    }
+    if (tid == 0u) res[0] = bi[0];
+}

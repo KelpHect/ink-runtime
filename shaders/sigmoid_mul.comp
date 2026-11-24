@@ -1,0 +1,21 @@
+#version 460
+
+// sigmoid_mul.comp — fused output-gate multiply: o[i] *= sigmoid(g[i]).
+//
+// Mirrors the tail of ops.cpp::attn_step: gate = sigmoid(gate_attn @ x_q) then
+// o[i] *= gate[i]. Host runs the gate matvec into G (raw logits); this shader
+// applies sigmoid and multiplies in place.
+// One thread per element, strided. Dispatch: ceil(n/64) workgroups (n = 3072).
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) buffer OBuf           { float o[]; };  // [n] rw
+layout(set = 0, binding = 1, std430) readonly buffer GBuf  { float g[]; };  // [n] logits
+
+layout(push_constant) uniform Pc { uint n; } pc;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    o[i] *= 1.0 / (1.0 + exp(-g[i]));
+}
