@@ -1,0 +1,32 @@
+# Model weights & data (large binaries — not in git)
+Inkling-2-Mini/
+data/
+testdata/golden/*.npy
+*.safetensors
+*.gguf
+
+# Third-party reference code
+vendor/
+
+# Build output
+build/
+out/
+*.obj
+*.exe
+*.pdb
+*.ilk
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Logs / scratch
+*.log
+hf-download.log
+st_header.json
+nul
+
+# OS
+Thumbs.db
+.DS_Store
