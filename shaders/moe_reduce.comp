@@ -1,0 +1,21 @@
+#version 460
+
+// moe_reduce.comp — sum NSLOT per-slot MoE output rows into one row:
+//   out[r] = sum_{s<NSLOT} rows[s*n + r]
+// Each slot row already carries its router weight (applied inside
+// moe_accum_slot). One thread per element. Dispatch: ceil(n/64).
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer RBuf { float rows[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer OBuf { float o[]; };
+
+layout(push_constant) uniform Pc { uint n; uint nslot; } pc;
+
+void main() {
+    const uint r = gl_GlobalInvocationID.x;
+    if (r >= pc.n) return;
+    float acc = 0.0;
+    for (uint s = 0; s < pc.nslot; s++) acc += rows[s * pc.n + r];
+    o[r] = acc;
+}

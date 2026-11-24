@@ -1,0 +1,105 @@
+#version 460
+
+// moe_accum_mslot.comp — per-expert finalize (softcapped SwiGLU + weighted
+// down-proj), merged slots: ONE dispatch covers all top-k slots.
+//
+// Identical math to moe_accum_slot.comp; slot = gl_WorkGroupID.y indexes
+// the device-resident router output (IDX/W) and the per-slot output row:
+//   slot = gl_WorkGroupID.y, e = idx[slot], ws = wt[slot]
+//   a[mm] = softcap(gate_s[mm], gcap) * sigmoid(gate_s[mm])
+//             * softcap(up_s[mm], ucap)
+//   rows[slot*R + r] = ws * dot(W2[e,r,:], a)
+//
+// Per-slot rows let the 8 expert weight streams run in one dispatch (no
+// accumulate races); moe_reduce.comp folds the rows afterwards.
+// pc.e / pc.wscale are unused (kept for struct-layout parity).
+// Dispatch: grid = {R rows (D=2304), nslots}.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer GTBuf { float gt[]; };
+layout(set = 0, binding = 1, std430) readonly buffer UPBuf { float up[]; };
+layout(set = 0, binding = 2, std430) readonly buffer WBuf  { uint  w[]; };
+layout(set = 0, binding = 3, std430) readonly buffer SBuf  { uint  s[]; };
+layout(set = 0, binding = 4, std430) readonly buffer ABuf  { float amax[]; };
+layout(set = 0, binding = 5, std430) readonly buffer O2Buf { float osd[]; };
+layout(set = 0, binding = 6, std430) buffer OBuf           { float o[]; };
+layout(set = 0, binding = 7, std430) readonly buffer IBuf  { int   idx[]; };
+layout(set = 0, binding = 8, std430) readonly buffer WtBuf { float wt[]; };
+
+layout(push_constant) uniform Pc {
+    uint  e;        // unused (slot = gl_WorkGroupID.y)
+    uint  R;        // W2 rows per expert = D (2304)
+    uint  I;        // inner dim = intermediate_size (1152)
+    uint  quant;    // 0 = NVFP4, 1 = MXFP8
+    float gcap;
+    float ucap;
+    float wscale;   // unused
+} pc;
+
+shared float red[64];
+shared float a[1152];
+
+const float E2M1[16] = float[16](0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                                 -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0);
+
+float f8e4m3_to_f32(uint v) {
+    uint sgn = v >> 7, ex = (v >> 3) & 0xFu, mn = v & 7u;
+    float x = (ex == 0u) ? ldexp(float(mn) / 8.0, -6)
+                         : ldexp(1.0 + float(mn) / 8.0, int(ex) - 7);
+    return sgn != 0u ? -x : x;
+}
+float softcap(float x, float c) { return c * tanh(x / c); }
+
+void main() {
+    const uint r    = gl_WorkGroupID.x;
+    const uint slot = gl_WorkGroupID.y;
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint e    = uint(idx[slot]);
+    const float ws  = wt[slot];
+    const uint base = slot * pc.I;   // this slot's gate/up row base
+
+    // phase 1: a[mm] for this slot's gate/up rows
+    for (uint mm = tid; mm < pc.I; mm += 64u) {
+        float g = gt[base + mm], u = up[base + mm];
+        a[mm] = softcap(g, pc.gcap) * (1.0 / (1.0 + exp(-g))) * softcap(u, pc.ucap);
+    }
+    barrier();
+
+    // phase 2: dot(W2[e,r,:], a)
+    const uint kv = pc.I;
+    float acc = 0.0;
+    if (pc.quant == 0u) {
+        const uint wb = (e * pc.R + r) * (kv >> 3);
+        const uint sb = (e * pc.R + r) * (kv >> 6);
+        for (uint k = tid; k < kv; k += 64u) {
+            uint word = w[wb + (k >> 3)];
+            uint bytev = (word >> (((k >> 1) & 3u) * 8u)) & 0xFFu;
+            uint nib = (k & 1u) != 0u ? (bytev >> 4) : (bytev & 0xFu);
+            uint sw = s[sb + (k >> 6)];
+            float bs = f8e4m3_to_f32((sw >> (((k >> 4) & 3u) * 8u)) & 0xFFu);
+            acc += E2M1[nib] * bs * a[k];
+        }
+    } else {
+        const uint wb = (e * pc.R + r) * (kv >> 2);
+        const uint sb = (e * pc.R + r) * (kv >> 7);
+        for (uint k = tid; k < kv; k += 64u) {
+            float wv = f8e4m3_to_f32((w[wb + (k >> 2)] >> ((k & 3u) * 8u)) & 0xFFu);
+            uint sw = s[sb + (k >> 7)];
+            float bs = ldexp(1.0, int((sw >> (((k >> 5) & 3u) * 8u)) & 0xFFu) - 127);
+            acc += wv * bs * a[k];
+        }
+    }
+
+    red[tid] = acc;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    if (tid == 0u) {
+        float res = red[0];
+        if (pc.quant == 0u) res *= amax[e] / osd[0];
+        o[slot * pc.R + r] = ws * res;
+    }
+}

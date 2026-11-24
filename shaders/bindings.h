@@ -208,4 +208,112 @@ struct PcMoeAccum {
 /*   b0 ro f32 PV[P]  b1 ro u32 PI[P]  b2 wo u32 RES[1] (argmax idx)  */
 /*   PC {uint p}                                                      */
 
+/* moe_reduce.comp:  o[r] = sum_{s<nslot} rows[s*n + r]                 */
+/*   (per-slot rows already weighted by router w inside moe_accum)     */
+/*   b0 ro f32 ROWS[nslot*n]  b1 wo f32 OUT[n];  PC {uint n; uint nslot}*/
+struct PcMoeReduce { uint32_t n, nslot; };
+
+
+/* ================================================================== */
+/* SEQ VARIANTS (GpuPrefill batched-chunk prefill):                     */
+/*   Each *_seq shader is the row-batched twin of the base kernel: the  */
+/*   workgroup/element index gains a ROW axis t in [0,T) -- grid.y or  */
+/*   grid.z carries it, or grid.x covers strided rows. A "row" is one  */
+/*   prompt position of the T-token chunk; semantics per row are       */
+/*   byte-identical to the base shader (see docs/PREFILL.md).          */
+/*                                                                    */
+/* embed_norm_seq.comp  grid.x = T                                     */
+/*   token = toks[pc.base + row]; out[row*n] = rmsnorm_w(embed[token]) */
+/*   b0 ro u32 EMB[V*n]  b1 ro i32 TOKS[P]  b2 ro f32 GAMMA[n]         */
+/*   b3 wo f32 OUT[T*n]                                               */
+struct PcEmbedSeq { uint32_t base, n; float eps; uint32_t flags; };
+
+/* rmsnorm_seq.comp  grid.x = n_rows                                   */
+/*   x[row*xs + i] -> o[row*os + i]  (xs/os = element strides; set     */
+/*   both = n for contiguous rows).                                   */
+struct PcRmsnormSeq { uint32_t n; float eps; uint32_t flags, xs, os; };
+
+/* matvec_*_seq.comp  grid = (M, T)                                    */
+/*   out[t*M + m0 + wgid.x] = W[m] . x[t*xs + k]                      */
+struct PcMatvecSeq { uint32_t K, m0, xs, M; };
+
+/* matvec_nvfp4_seq / matvec_mxfp8_seq  grid = (M, T)                  */
+/*   slot-indexed expert GEMV: e = idx[t*ktop + pc.e];                 */
+/*   out[(t*ktop + pc.e)*M + m] = dot(W[e,row(m),:], x[t*K + k])       */
+/*   Bindings as the *_slot variants (IDX last).                      */
+struct PcNvfp4Seq {
+    uint32_t e, R, K, row0, row_stride;
+    float    wscale;
+    uint32_t flags, ktop, M;
+};
+struct PcMxfp8Seq {
+    uint32_t e, R, K, row0, row_stride;
+    float    wscale;
+    uint32_t flags, ktop, M;
+};
+
+/* moe_accum_seq.comp  grid = (D, T)                                   */
+/*   gate/up read at row base t*gstride (+s*I via binding offset);     */
+/*   e = idx[t*ktop + pc.e]; ws = wt[t*ktop + pc.e];                   */
+/*   out[t*R + r] += ws * dot(W2[e,r,:], a)                            */
+struct PcMoeAccumSeq {
+    uint32_t e, R, I, quant;
+    float    gcap, ucap, wscale;   /* wscale unused (slot) */
+    uint32_t ktop, gstride;
+};
+
+/* conv4_static_seq / conv4_dynamic_seq                                */
+/*   grid = (ceil(C/64), T) compute pass; then a second dispatch       */
+/*   (grid.y = 1, flags F_SEQ_STATE) shifts the row-major h3 history   */
+/*   and optionally exports the channel-major decode hist.             */
+/*   Tap lag reads x[t-lag] for t-lag>=0 else h3[3+t-lag] (0=cold).    */
+/*   b0 ro X[T*C]  b1 ro W|SW  (b2 ro DYN dyn-only)  b(2|3) rw H3[3*C] */
+/*   b(3|4) wo OUT[T*C]  b(4|5) wo HIST[C*3] channel-major             */
+constexpr uint32_t F_SEQ_STATE = 1u << 1;  /* state-update pass        */
+constexpr uint32_t F_SEQ_EXPORT = 1u << 2; /* also write decode HIST   */
+struct PcConv4StaticSeq { uint32_t C, T, flags; };
+struct PcConv4DynSeq { uint32_t C, head_dim, T, flags; };
+
+/* attn_res_seq.comp  grid.x = T                                       */
+/*   srcs for row t at src[t*ss + s*D] (s<N); out[t*os + qi*D]         */
+struct PcAttnResSeq { uint32_t N, D, Q, ss, os; };
+
+/* msg_gate_seq.comp  grid.x = T                                       */
+/*   dst[t*ds + i], msg[t*ms + i] -> out[t*os + i]                     */
+struct PcMsgGateSeq { uint32_t D, rank, ds, ms, os; };
+
+/* router_seq.comp  grid.x = T (local_size 128)                        */
+/*   x[t*K + j]; idx[t*k + s], w[t*k + s]                              */
+struct PcRouterSeq { uint32_t n_experts, k, K; float route_scale; };
+
+/* attn_scores_seq.comp  grid = (HQ, ceil(n/64), T)                    */
+/*   query row t = wgid.z (position pos0+t). j valid iff               */
+/*   j0_t <= j <= pos0+t with j0_t = full ? 0 : max(0, pos0+t+1-swa);  */
+/*   else write -1e30. pstride = n+1 (n = pos0+T = row width).         */
+struct PcAttnScoresSeq {
+    uint32_t hq, hk, dh, n /*max col+1*/, pos0, ext, pstride, swa, flags;
+};
+constexpr uint32_t F_SEQ_FULL = 1u << 0;  /* full-attention layer       */
+
+/* attn_softmax_seq.comp  grid = (HQ, T)                               */
+/*   row (t*hq + h) at p[(t*hq+h)*pstride + j], n = row width,         */
+/*   sink[h] at sink[t*hq + h], prob written at index n.               */
+struct PcAttnSoftmaxSeq { uint32_t n, pstride, hq; };
+
+/* attn_accum_seq.comp  grid = (HQ, T)                                 */
+/*   o[t*hq*dh + h*dh + d] = sum_jj p[.. + jj] * v[jj*hk*dh + g*dh+d] */
+struct PcAttnAccumSeq { uint32_t hq, hk, dh, n, pstride; };
+
+/* rel_bias_seq.comp  grid = (ceil(n/64), T)                           */
+/*   rel[t*n + g] = sum_e r[t*HQ*dr + h*dr + e] * proj[e*ext + d]      */
+struct PcRelBiasSeq { uint32_t dr, ext, n /* = HQ*ext */; };
+
+/* l2_clip_seq.comp  grid = (heads, T)                                 */
+/*   head h of row t at v[t*hstride + h*dim]                           */
+struct PcL2ClipSeq { uint32_t dim; float thr; uint32_t flags, hstride; };
+
+/* log_scale_seq.comp  grid = ceil(T*n/64)                             */
+/*   v[gid] *= tau[gid / n]  (tau buffer bound at b1, host-computed)   */
+struct PcLogScaleSeq { uint32_t n, total, pos0; };
+
 }  // namespace ink::shaders

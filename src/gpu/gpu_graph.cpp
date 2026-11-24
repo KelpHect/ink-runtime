@@ -121,27 +121,33 @@ ink::vk::Buffer GpuGraph::upload_dev(const void* src, VkDeviceSize bytes) {
     if (err_.empty()) err_ = "alloc_device_local failed: " + alloc_->last_error;
     return {};
   }
-  if (staging_.size < bytes) {
+  const VkDeviceSize CH = 64ull << 20;  // staging slab; one submit per chunk
+  if (staging_.size < CH) {
     alloc_->free(staging_);
-    staging_ = alloc_->alloc_host(bytes);
+    staging_ = alloc_->alloc_host(CH);
     if (!staging_.buf) {
       err_ = "staging alloc failed";
       return {};
     }
   }
-  std::memcpy(alloc_->mapped(staging_), src, size_t(bytes));
-  vk::Recorder r;
-  if (!r.begin(tpool_)) {
-    err_ = r.error();
-    return {};
-  }
-  r.copy_buffer(staging_.buf, dst.buf, bytes);
-  if (!r.submit_and_wait(ctx_->copy_queue())) {
-    err_ = "upload submit failed: " + r.error();
+  char* sp = (char*)alloc_->mapped(staging_);
+  const char* s = (const char*)src;
+  for (VkDeviceSize off = 0; off < bytes; off += CH) {
+    const VkDeviceSize n = std::min(CH, bytes - off);
+    std::memcpy(sp, s + off, size_t(n));
+    vk::Recorder r;
+    if (!r.begin(tpool_)) {
+      err_ = r.error();
+      return {};
+    }
+    r.copy_buffer(staging_.buf, dst.buf, n, 0, off);
+    if (!r.submit_and_wait(ctx_->copy_queue())) {
+      err_ = "upload submit failed: " + r.error();
+      r.shutdown();
+      return {};
+    }
     r.shutdown();
-    return {};
   }
-  r.shutdown();
   stats.uploads++;
   stats.upload_bytes += bytes;
   return dst;
@@ -641,45 +647,49 @@ void GpuGraph::emit_visit(int i, int p, int64_t pos) {
     cp(rw_, 0, readback_, (rb_dbg_ + int64_t(13) * H) * 4 + 32, 32);
   }
 
-  // MoE: zero the accumulator, then per-slot gate/up + serial accumulate.
-  fill(moe_out_, 0, Hb, 0u, "moe_zero");
-  const Pipe& p13 = L.mxfp8 ? p_mx8s_ : p_nv4s_;
+  // MoE: per-slot gate/up (16 unsynced GEMVs), then 8 unsynced w2+swiglu
+  // writing per-slot rows (zeroed up front; += semantics inside the shader),
+  // then one moe_reduce summing the rows into moe_out_. The 8 expert weight
+  // streams overlap on the link instead of serializing behind per-slot
+  // barriers — w2 bytes are ~1/3 of the per-token PCIe traffic.
+  fill(moe_rows_, 0, 8 * Hb, 0u, "moe_zero");
+  const Pipe& p13 = L.mxfp8 ? p_mx8m_ : p_nv4m_;
   const int64_t I = c.intermediate_size;
-  for (uint32_t s = 0; s < 8; s++) {
-    if (L.mxfp8) {
-      sh::PcMxfp8 pg{s, uint32_t(L.w13R), uint32_t(H), 0u, 2u, 1.f, 0u};
-      op(p13,
-         {BW(*L.w13), BW(*L.w13s), BW(mn_), BA(gate_, int64_t(s) * I, I),
-          BW(ridx_)},
-         &pg, sizeof(pg), uint32_t(I), 1, "w13");
-      sh::PcMxfp8 pu{s, uint32_t(L.w13R), uint32_t(H), 1u, 2u, 1.f, 0u};
-      op(p13,
-         {BW(*L.w13), BW(*L.w13s), BW(mn_), BA(up_, int64_t(s) * I, I),
-          BW(ridx_)},
-         &pu, sizeof(pu), uint32_t(I), 1, "w13");
-    } else {
-      sh::PcNvfp4 pg{s, uint32_t(L.w13R), uint32_t(H), 0u, 2u, 1.f, 0u};
-      op(p13,
-         {BW(*L.w13), BW(*L.w13s), BW(*L.w13a), BW(*L.w13o), BW(mn_),
-          BA(gate_, int64_t(s) * I, I), BW(ridx_)},
-         &pg, sizeof(pg), uint32_t(I), 1, "w13");
-      sh::PcNvfp4 pu{s, uint32_t(L.w13R), uint32_t(H), 1u, 2u, 1.f, 0u};
-      op(p13,
-         {BW(*L.w13), BW(*L.w13s), BW(*L.w13a), BW(*L.w13o), BW(mn_),
-          BA(up_, int64_t(s) * I, I), BW(ridx_)},
-         &pu, sizeof(pu), uint32_t(I), 1, "w13");
-    }
+  // All 8 expert slots in ONE dispatch per weight (slot = gl_WorkGroupID.y):
+  // per-dispatch fixed cost, not bandwidth, dominated the per-slot version.
+  if (L.mxfp8) {
+    sh::PcMxfp8 pg{0u, uint32_t(L.w13R), uint32_t(H), 0u, 2u, 1.f, 0u};
+    op(p13, {BW(*L.w13), BW(*L.w13s), BW(mn_), BW(gate_), BW(ridx_)}, &pg,
+       sizeof(pg), uint32_t(I), 8, "w13");
+    sh::PcMxfp8 pu{0u, uint32_t(L.w13R), uint32_t(H), 1u, 2u, 1.f, 0u};
+    op(p13, {BW(*L.w13), BW(*L.w13s), BW(mn_), BW(up_), BW(ridx_)}, &pu,
+       sizeof(pu), uint32_t(I), 8, "w13");
+  } else {
+    sh::PcNvfp4 pg{0u, uint32_t(L.w13R), uint32_t(H), 0u, 2u, 1.f, 0u};
+    op(p13, {BW(*L.w13), BW(*L.w13s), BW(*L.w13a), BW(*L.w13o), BW(mn_),
+             BW(gate_), BW(ridx_)},
+       &pg, sizeof(pg), uint32_t(I), 8, "w13");
+    sh::PcNvfp4 pu{0u, uint32_t(L.w13R), uint32_t(H), 1u, 2u, 1.f, 0u};
+    op(p13, {BW(*L.w13), BW(*L.w13s), BW(*L.w13a), BW(*L.w13o), BW(mn_),
+             BW(up_), BW(ridx_)},
+       &pu, sizeof(pu), uint32_t(I), 8, "w13");
   }
   sync();
-  for (uint32_t s = 0; s < 8; s++) {
-    sh::PcMoeAccum pc{s, uint32_t(L.w2R), uint32_t(I), L.mxfp8 ? 1u : 0u,
+  {
+    sh::PcMoeAccum pc{0u, uint32_t(L.w2R), uint32_t(I), L.mxfp8 ? 1u : 0u,
                       float(c.mlp_gate_softcap), float(c.mlp_up_softcap), 0.f};
-    op(p_moe_,
-       {BA(gate_, int64_t(s) * I, I), BA(up_, int64_t(s) * I, I), BW(*L.w2),
-        BW(*L.w2s), BW(*L.w2a), BW(*L.w2o), BW(moe_out_), BW(ridx_), BW(rw_)},
-       &pc, sizeof(pc), uint32_t(H), 1, "w2");
-    sync();  // serial: each slot does += on moe_out
+    op(p_moem_,
+       {BW(gate_), BW(up_), BW(*L.w2), BW(*L.w2s), BW(*L.w2a), BW(*L.w2o),
+        BW(moe_rows_), BW(ridx_), BW(rw_)},
+       &pc, sizeof(pc), uint32_t(H), 8, "w2");
   }
+  sync();
+  {
+    sh::PcMoeReduce pc{uint32_t(H), 8u};
+    op(p_mred_, {BW(moe_rows_), BW(moe_out_)}, &pc, sizeof(pc),
+       wg64(H), 1, "moe_reduce");
+  }
+  sync();
   dbg_cp(moe_out_, 11);
   {
     sh::PcConv4Static pc{uint32_t(H), uint32_t(conv_filled_[slot][3]),
@@ -892,6 +902,7 @@ bool GpuGraph::init(const ModelConfig& c, const WeightStore& w,
   rw_ = dev(32);
   gate_ = dev(8 * 1152 * 4);
   up_ = dev(8 * 1152 * 4);
+  moe_rows_ = dev(8 * H * 4);
   kvk_ = dev(48 * cap_ * 1024 * 4);
   kvv_ = dev(48 * cap_ * 1024 * 4);
   hist_ = dev(48 * 4 * 3 * H * 4);
@@ -926,7 +937,11 @@ bool GpuGraph::init(const ModelConfig& c, const WeightStore& w,
       load_pipe("attn_res", 3, sizeof(sh::PcAttnRes), p_ares_) &&
       load_pipe("msg_gate", 6, sizeof(sh::PcMsgGate), p_msg_) &&
       load_pipe("router", 5, sizeof(sh::PcRouter), p_rtr_) &&
+      load_pipe("moe_accum_mslot", 9, sizeof(sh::PcMoeAccum), p_moem_) &&
+      load_pipe("matvec_nvfp4_mslot", 7, sizeof(sh::PcNvfp4), p_nv4m_) &&
+      load_pipe("matvec_mxfp8_mslot", 5, sizeof(sh::PcMxfp8), p_mx8m_) &&
       load_pipe("moe_accum_slot", 9, sizeof(sh::PcMoeAccum), p_moe_) &&
+      load_pipe("moe_reduce", 2, sizeof(sh::PcMoeReduce), p_mred_) &&
       load_pipe("sigmoid_mul", 2, sizeof(PcN), p_sig_) &&
       load_pipe("softcap", 1, sizeof(PcCap), p_cap_) &&
       load_pipe("vadd", 3, sizeof(PcN), p_add_) &&
@@ -1031,6 +1046,11 @@ bool GpuGraph::init(const ModelConfig& c, const WeightStore& w,
       const TensorView* t = get(n);
       if (t) {
         out.b = dev_w(*t);
+        if (!out.b) {          // VRAM pressure: degrade to host mirror
+          std::string e0 = err_;
+          out.b = host_w(*t);
+          if (out.b) err_ = e0;
+        }
         out.p = mvpipe(t->dtype);
         if (!out.p) missing.push_back(n + " dtype");
       }
@@ -1089,11 +1109,34 @@ bool GpuGraph::init(const ModelConfig& c, const WeightStore& w,
             L.ctrl[s][2] = dev_f32(*t);
         }
     }
-    // expert tensors -> host-visible mirrors (amax/osd exist only on nvfp4)
-    HB(lname(i, "mlp.experts.w13_weight"), L.w13);
-    HB(lname(i, "mlp.experts.w13_weight_scale"), L.w13s);
-    HB(lname(i, "mlp.experts.w2_weight"), L.w2);
-    HB(lname(i, "mlp.experts.w2_weight_scale"), L.w2s);
+    // expert tensors: device-resident while expert_vram_ budget lasts
+    // (nvfp4 layers first in visit order — best bytes-saved per VRAM byte);
+    // host-visible mirrors after that (amax/osd exist only on nvfp4)
+    auto EX = [&](const std::string& n, const vk::Buffer*& out) {
+      const TensorView* t = w.find(n);
+      if (!t || !t->data) {
+        missing.push_back(n);
+        return;
+      }
+      out = nullptr;
+      // dev-resident while the device heap has real headroom (VK_EXT mem
+      // budget); reserve ~768MiB for remaining mandatory allocs + driver.
+      VkDeviceSize hb = 0, hu = 0;
+      const bool room =
+          alloc_->heap_budget(1, hb, hu) &&
+          hb > hu + VkDeviceSize(t->nbytes()) + (VkDeviceSize(768) << 20);
+      if (room) {
+        std::string e0 = err_;
+        out = dev_w(*t);
+        if (!out) err_ = e0;  // VRAM full: drop dev_w's error, mirror on host
+      }
+      if (!out) out = host_w(*t);
+      if (!out) missing.push_back(n);
+    };
+    EX(lname(i, "mlp.experts.w13_weight"), L.w13);
+    EX(lname(i, "mlp.experts.w13_weight_scale"), L.w13s);
+    EX(lname(i, "mlp.experts.w2_weight"), L.w2);
+    EX(lname(i, "mlp.experts.w2_weight_scale"), L.w2s);
     L.w13a = L.w13o = L.w2a = L.w2o = &dummy4_;
     if (!L.mxfp8) {
       HB(lname(i, "mlp.experts.w13_weight_amax"), L.w13a);
@@ -1198,7 +1241,8 @@ void GpuGraph::shutdown() {
     if (b->buf) alloc_->free(*b);
   Pipe* pipes[] = {&p_rms_, &p_mvf_, &p_mvb_, &p_mv8_, &p_cvs_, &p_cvd_,
                    &p_rel_, &p_sco_, &p_smx_, &p_acc_, &p_ares_, &p_msg_,
-                   &p_rtr_, &p_moe_, &p_sig_, &p_cap_, &p_add_, &p_l2_,
+                   &p_rtr_, &p_moe_, &p_mred_, &p_moem_, &p_nv4m_, &p_mx8m_,
+                   &p_sig_, &p_cap_, &p_add_, &p_l2_,
                    &p_log_, &p_emb_, &p_nv4s_, &p_mx8s_};
   for (auto* p : pipes) p->p.shutdown();
   cpool_.shutdown();

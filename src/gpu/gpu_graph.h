@@ -22,6 +22,11 @@
 namespace ink::gpu {
 
 class GpuGraph {
+  // GpuPrefill (src/gpu/gpu_prefill.*) shares this object's context,
+  // allocator, weights, pipelines and the kv/conv state buffers; it is the
+  // row-batched (T-token chunk) sibling of emit_token for prompt prefill.
+  friend class GpuPrefill;
+
  public:
   // ctx/alloc are caller-owned and must outlive the graph. ctx_cap = KV
   // capacity in tokens (the --ctx flag). shader_dir holds the .spv set.
@@ -125,6 +130,7 @@ class GpuGraph {
   std::string err_;
   bool ok_ = false;
   bool dbg_en_ = false;  // INK_DBG: emit stage-dump copies for visit5
+  VkDeviceSize expert_vram_ = 7ull << 30;  // dev-resident expert budget (safe under driver reserve)
 
   int H_ = 0;
   int64_t V_ = 0;    // unpadded vocab
@@ -138,7 +144,7 @@ class GpuGraph {
   ink::vk::Buffer reads_, msgs_, mgated_, inbuf_;
   ink::vk::Buffer q_, k_, v_, r_, tk_, tv_, rel_, probs_, grate_, sink_, o_;
   ink::vk::Buffer attn_out_, a_out_, residual_, m_in_, mn_, moe_out_, mo_;
-  ink::vk::Buffer ridx_, rw_, gate_, up_;
+  ink::vk::Buffer ridx_, rw_, gate_, up_, moe_rows_;
   ink::vk::Buffer kvk_, kvv_, hist_;
   ink::vk::Buffer h_, hfin_, logits_;
   ink::vk::Buffer readback_;  // HOST-visible: logits + taps + visit dumps
@@ -152,7 +158,8 @@ class GpuGraph {
   Lw lw_[24];
 
   Pipe p_rms_, p_mvf_, p_mvb_, p_mv8_, p_cvs_, p_cvd_, p_rel_, p_sco_, p_smx_,
-      p_acc_, p_ares_, p_msg_, p_rtr_, p_moe_, p_sig_, p_cap_, p_add_, p_l2_,
+      p_acc_, p_ares_, p_msg_, p_rtr_, p_moe_, p_mred_, p_moem_, p_nv4m_, p_mx8m_,
+      p_sig_, p_cap_, p_add_, p_l2_,
       p_log_, p_emb_, p_nv4s_, p_mx8s_;
 
   std::vector<ink::vk::DescSet> sites_;  // binding stream, built once
