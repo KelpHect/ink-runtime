@@ -130,11 +130,11 @@ void sconv4_static(const float* x, const TensorView& w, ConvState4& st,
   constexpr float inv = 0.4472135954999579f;  // 1/sqrt(4+1)
   std::vector<float> y(C);
   for (int c = 0; c < C; c++) {
-    // tap 0 = current token (07 §5; verify tap order vs golden)
-    float acc = w.f32(c, 0, 0) * x[c];
+    // conv1d layout [C,1,4]: tap 3 = current token, tap 0 = 3 steps back
+    float acc = w.f32(c, 0, 3) * x[c];
     for (int lag = 1; lag < 4; lag++) {
       float xin = (lag <= st.filled) ? st.s[size_t(c) * 3 + (lag - 1)] : 0.f;
-      acc += w.f32(c, 0, lag) * xin;
+      acc += w.f32(c, 0, 3 - lag) * xin;
     }
     y[c] = (acc + x[c]) * inv;
   }

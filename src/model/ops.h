@@ -38,7 +38,8 @@ struct ConvState4 {
   std::vector<float> s;            // s[c*3+i] = x[t-1-i], i in 0..2
   void init(int channels);
 };
-// Static taps w [C,1,4]; out = (conv(x)+x)/sqrt(5). x may alias out.
+// Static taps w [C,1,4] in conv1d layout (tap 3 = current); out =
+// (conv(x)+x)/sqrt(5). x may alias out.
 void sconv4_static(const float* x, const TensorView& w, ConvState4& st,
                    float* out);
 // Dynamic taps (full-attn layers): per-token dyn [(C/head_dim)*4] added to
