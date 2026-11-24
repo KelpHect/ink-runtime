@@ -11,7 +11,7 @@ Sources: `research/01` (hardware), `03` (ROCm), `04` (APIs), `05`/`11` (tiered r
 |---|---|---|
 | VRAM GEMV | ~500 GB/s (455–530 in llama.cpp; 592 cl-mem) | resident weights = ~1µs per MB/token |
 | PCIe 5 x16 pinned H2D | ~45–55 GB/s (board-dependent 38–57 — **verify LnkSta**) | 4.5MB expert ≈ 90µs |
-| CPU GEMV over DDR5 | ~40–65 GB/s effective | 4.5MB expert ≈ 75–110µs (≈break-even vs PCIe) |
+| CPU GEMV over **DDR4-2666 (measured: mismatched 2×8+2×16GB kits)** | ~35–42 GB/s theoretical → ~25–35 effective | 4.5MB expert ≈ 130–180µs — **slower than PCIe**; prefer H2D streaming |
 | NVMe expert reads (QD8+, ≥1MB) | ~4–6.5 GB/s | 4.5MB expert ≈ 0.7–1.1ms |
 | NVMe 4K QD1 / mmap faults | ~0.1–1.2 GB/s | forbidden on hot path |
 
@@ -69,6 +69,8 @@ No math-rate fuse on AMD. Gains are platform/software:
 - **Attention**: custom kernel mandatory (SWA 1024 + QK-L2 clip + softcap 30 + rel-pos d_rel=16 + learned sink). Base: ck_tile FMHA (SWA + softcap already templated, HIP); Vulkan port of same structure. wave64.
 - **MoE exec**: dequant-fused per-expert GEMV at decode (M=1–9 — bandwidth-bound, skip grouped-GEMM padding); grouped GEMM (BLOCK_M) for prefill; `moe_sorting` (aiter) as reference.
 - **Dispatch overhead**: ~7k launches/token kills naive backends (73% GPU time in kTransformers profile) → pre-recorded command buffers per shape (decode/draft-verify/prefill-bucket), timeline semaphores, dedicated transfer queue for H2D.
+
+**RAM caveat (measured on this box)**: 48GB = 2×8GB DDR4-2666 + 2×16GB DDR4-3200 mismatched → all run at 2666 MT/s in flex-asymmetric mode → ~40 GB/s tier bandwidth, ~half the assumed DDR5 budget. Consequences: (a) PCIe-5 streaming (~50 GB/s) beats CPU-side expert compute (~25–35 GB/s delivered) — invert the Fiddler default: prefer H2D copies for misses, keep CPU-exec only for truly-late fp8-tail misses or when PCIe is saturated; (b) an XMP bump to 3200 is capped by the slow sticks — treat ~40 GB/s as the planning number; (c) the RAM tier still holds the full 15.7GB expert mirror + fp8 KV — capacity is unaffected, only its bandwidth.
 
 ## 7. The expert-tiering engine (the differentiator, ~1k LOC)
 
