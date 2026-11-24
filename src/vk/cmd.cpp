@@ -130,6 +130,11 @@ void Recorder::copy_buffer(VkBuffer src, VkBuffer dst, VkDeviceSize size,
   vkCmdCopyBuffer(cb_, src, dst, 1, &r);
 }
 
+void Recorder::fill_buffer(VkBuffer dst, VkDeviceSize off, VkDeviceSize size,
+                           uint32_t data) {
+  vkCmdFillBuffer(cb_, dst, off, size, data);
+}
+
 void Recorder::barrier(VkPipelineStageFlags src_stage,
                        VkPipelineStageFlags dst_stage,
                        VkAccessFlags src_access, VkAccessFlags dst_access) {

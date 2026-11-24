@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <stdexcept>
@@ -203,6 +205,16 @@ void attn_step(const ModelConfig& c, const AttnW& A, bool full,
   matvec(A.wv, xv, v.data(), HK * DH, H);
   matvec(A.wr, xq, r.data(), HQ * DR, H);
 
+  if (std::getenv("INK_DBG")) {
+    static int pre = 0;
+    if (pre++ == 5) {
+      FILE* f = std::fopen("testdata/ink_dbg_cpu/dbgA_kpre.bin", "wb");
+      if (f) {
+        std::fwrite(k.data(), 4, size_t(HK * DH), f);
+        std::fclose(f);
+      }
+    }
+  }
   if (full) {
     // dynamic taps come from the sublayer input (x_k / x_v), not from k/v
     std::vector<float> tk(HK * 4), tv(HK * 4);
@@ -279,6 +291,24 @@ void attn_step(const ModelConfig& c, const AttnW& A, bool full,
     }
   }
   for (int i = 0; i < HQ * DH; i++) o[i] *= gate[i];
+  if (std::getenv("INK_DBG")) {
+    static int call = 0;
+    if (call++ == 5) {  // visit5 == first full layer
+      auto w = [](const char* nm, const float* x, int n) {
+        char p[256];
+        std::snprintf(p, sizeof p, "testdata/ink_dbg_cpu/%s.bin", nm);
+        FILE* f = std::fopen(p, "wb");
+        if (f) {
+          std::fwrite(x, 4, size_t(n), f);
+          std::fclose(f);
+        }
+      };
+      w("dbgA_q", q.data(), HQ * DH);
+      w("dbgA_k", k.data(), HK * DH);
+      w("dbgA_v", v.data(), HK * DH);
+      w("dbgA_o", o.data(), HQ * DH);
+    }
+  }
   matvec(A.wo, o.data(), out, H, HQ * DH);
 }
 
@@ -385,6 +415,17 @@ void moe_forward(const ModelConfig& c, const MlpW& m, const float* x,
   std::vector<float> w(k);
   router_topk(m.router_w, m.router_b, x, c.n_routed_experts, k,
               float(c.route_scale), idx.data(), w.data());
+  if (std::getenv("INK_DBG")) {
+    static bool once = false;
+    if (!once) {
+      once = true;
+      std::fprintf(stderr, "router idx:");
+      for (int i = 0; i < k; i++) std::fprintf(stderr, " %d", idx[i]);
+      std::fprintf(stderr, " w:");
+      for (int i = 0; i < k; i++) std::fprintf(stderr, " %.4f", w[i]);
+      std::fprintf(stderr, "\n");
+    }
+  }
 
   const ExpertW& E = m.experts;
   std::vector<float> gate(I), up(I), a(I);

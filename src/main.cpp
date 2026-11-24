@@ -4,6 +4,7 @@
 #include "model/backend.h"
 #include "model/graph.h"
 #ifdef INK_WITH_VULKAN
+#include "gpu/gpu_graph.h"
 #include "gpu/vk_backend.h"
 #endif
 
@@ -85,7 +86,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr,
                  "usage: ink <model_dir> [--prompt \"...\"] [--tokens N] "
                  "[--ctx N] [--token-ids a,b,c] [--dump dir] "
-                 "[--backend cpu|vk] [--shader-dir dir]\n");
+                 "[--backend cpu|vk|gpu] [--shader-dir dir]\n");
     return 1;
   }
   std::string dir = argv[1];
@@ -171,7 +172,11 @@ int main(int argc, char** argv) {
   std::printf("graph: all weights resolved\n");
 
 #ifdef INK_WITH_VULKAN
+  ink::vk::Context vkctx;
+  ink::vk::Allocator vkalloc;
   ink::gpu::VkBackend vk_backend;
+  ink::gpu::GpuGraph gpu_graph;
+  const bool gpu_mode = backend == "gpu";
   if (backend == "vk") {
     if (!vk_backend.init(shader_dir, err)) {
       std::fprintf(stderr, "vk backend: %s\n", err.c_str());
@@ -179,6 +184,21 @@ int main(int argc, char** argv) {
     }
     ops::backend_slot() = &vk_backend;
     std::printf("backend: vk (shader-dir %s)\n", shader_dir.c_str());
+  } else if (gpu_mode) {
+    if (!vkctx.init()) {
+      std::fprintf(stderr, "vk context: %s\n", vkctx.last_error.c_str());
+      return 1;
+    }
+    if (!vkalloc.init(vkctx)) {
+      std::fprintf(stderr, "vk allocator: %s\n", vkalloc.last_error.c_str());
+      return 1;
+    }
+    if (!gpu_graph.init(cfg, store, vkctx, vkalloc, shader_dir, ctx, &err)) {
+      std::fprintf(stderr, "gpu backend: %s\n", err.c_str());
+      return 1;
+    }
+    std::printf("backend: gpu (shader-dir %s, ctx %d)\n", shader_dir.c_str(),
+                ctx);
   } else
 #endif
   {
@@ -212,32 +232,90 @@ int main(int argc, char** argv) {
     ids = {200028};  // <|begin_of_text|>
   }
 
+  // Backend-agnostic forward + dump plumbing. GpuGraph keeps state on the
+  // device and exposes taps/visit dumps through its readback after the
+  // single per-token submit; Graph exposes them via visit_hook / state().
+  auto forward = [&](int tok, int64_t p) -> const std::vector<float>& {
+#ifdef INK_WITH_VULKAN
+    if (gpu_mode) return gpu_graph.forward_token(tok, p);
+#endif
+    return g.forward_token(tok, p);
+  };
+  auto last_logits = [&]() -> const std::vector<float>& {
+#ifdef INK_WITH_VULKAN
+    if (gpu_mode) return gpu_graph.logits();
+#endif
+    return g.state().logits;
+  };
+  auto dump_all = [&](int step) {
+#ifdef INK_WITH_VULKAN
+    if (gpu_mode) {
+      // per-visit in/out for tools/compare_visits.py (visit%02d_*_stepN.bin)
+      for (int v = 0; v < 48; v++) {
+        char name[64];
+        for (int ph = 0; ph < 2; ph++) {
+          std::snprintf(name, sizeof(name), "visit%02d_%s", v,
+                        ph ? "out" : "in");
+          dump_f32(dump_dir, name, step, gpu_graph.visit_dump(v, ph),
+                   size_t(cfg.hidden_size));
+        }
+      }
+      static const char* tapn[3] = {"hidden_visit5", "hidden_visit23",
+                                    "hidden_visit41"};
+      for (int i = 0; i < 3; i++)
+        dump_f32(dump_dir, tapn[i], step, gpu_graph.tap(i),
+                 size_t(cfg.hidden_size));
+      dump_f32(dump_dir, "hidden_final", step, gpu_graph.tap(3),
+               size_t(cfg.hidden_size));
+      dump_f32(dump_dir, "logits", step, gpu_graph.logits().data(),
+               gpu_graph.logits().size());
+      if (std::getenv("INK_DBG") && step == 0) {
+        for (int r = 0; r < 15; r++) {
+          char name[16];
+          std::snprintf(name, sizeof(name), "dbg%d", r);
+          // rows 0 and 4 hold 3072-wide vectors (q, gated o); rest are H-wide
+          size_t n = (r == 0 || r == 4) ? 3072 : size_t(cfg.hidden_size);
+          dump_f32("testdata/ink_dbg_gpu", name, 0, gpu_graph.dbg(r), n);
+        }
+        const float* r8 = gpu_graph.dbg(13);
+        const int32_t* ii = reinterpret_cast<const int32_t*>(r8);
+        const float* ww = r8 + 8;
+        std::fprintf(stderr, "router idx:");
+        for (int e = 0; e < 8; e++) std::fprintf(stderr, " %d", ii[e]);
+        std::fprintf(stderr, " w:");
+        for (int e = 0; e < 8; e++) std::fprintf(stderr, " %.4f", ww[e]);
+        std::fprintf(stderr, "\n");
+      }
+      return;
+    }
+#endif
+    dump_step(dump_dir, g.state(), step);
+  };
+
   int64_t pos = 0;
   size_t ip = 0;
   for (int t : ids) {
     if (++ip == ids.size()) cur_step = 0;  // tag last prompt token as step0
-    g.forward_token(t, pos++);
-    int am = ops::argmax(g.state().logits.data(),
-                         int(g.state().logits.size()));
+    forward(t, pos++);
+    const std::vector<float>& lg = last_logits();
+    int am = ops::argmax(lg.data(), int(lg.size()));
     std::printf("pos %lld prompt tok %d -> argmax %d\n", (long long)(pos - 1),
                 t, am);
-    if (!dump_dir.empty() && ip == ids.size())
-      dump_step(dump_dir, g.state(), 0);  // step0 = last prompt position
+    if (!dump_dir.empty() && ip == ids.size()) dump_all(0);
   }
-  int cur = ops::argmax(g.state().logits.data(),
-                        int(g.state().logits.size()));
+  int cur = ops::argmax(last_logits().data(), int(last_logits().size()));
   auto wall0 = std::chrono::steady_clock::now();
   std::vector<int> gen_ids;
   for (int t = 0; t < gen_tokens; t++) {
     cur_step = t + 1;
-    const std::vector<float>& logits = g.forward_token(cur, pos++);
+    const std::vector<float>& logits = forward(cur, pos++);
     int am = ops::argmax(logits.data(), int(logits.size()));
     float lp = logits[am];
     gen_ids.push_back(am);
     std::string txt = tok_loaded ? tok.decode({am}) : "";
     std::printf("gen %d: token %d (logit %.3f) %s\n", t, am, lp,
                 txt.c_str());
-    if (!dump_dir.empty()) dump_step(dump_dir, g.state(), t + 1);
+    if (!dump_dir.empty()) dump_all(t + 1);
     if (am == cfg.eos_token_id) break;
     cur = am;
   }
@@ -250,7 +328,19 @@ int main(int argc, char** argv) {
               (long long)(pos - (int64_t)ids.size()),
               wall / std::max<int64_t>(1, pos - (int64_t)ids.size()));
 #ifdef INK_WITH_VULKAN
-  if (backend == "vk") {
+  if (gpu_mode) {
+    auto& st = gpu_graph.stats;
+    std::printf(
+        "gpu: submits=%llu dispatches=%llu copies=%llu barriers=%llu "
+        "record=%.0fms wait=%.0fms uploads=%llu (%.2fGB) err: %s\n",
+        (unsigned long long)st.submits, (unsigned long long)st.dispatches,
+        (unsigned long long)st.copies, (unsigned long long)st.barriers,
+        st.record_ms, st.wait_ms, (unsigned long long)st.uploads,
+        st.upload_bytes / 1e9, gpu_graph.error().c_str());
+    gpu_graph.shutdown();  // before allocator/context teardown
+    vkalloc.shutdown();
+    vkctx.shutdown();
+  } else if (backend == "vk") {
     auto& st = vk_backend.stats;
     std::printf(
         "vk: submits=%llu wait=%.0fms uploads=%llu (%.2fGB %.0fms) "

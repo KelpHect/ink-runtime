@@ -148,6 +148,18 @@ struct PcMsgGate { uint32_t D, rank; };
 struct PcRouter { uint32_t n_experts, k, K; float route_scale; };
 
 /* ------------------------------------------------------------------ */
+/* SLOT VARIANTS (GpuGraph single-submit decode):                       */
+/*   The router's top-k output lives on the DEVICE; in a fully recorded */
+/*   command buffer the expert id / router weight cannot ride in push   */
+/*   constants, so these variants read them from the router's IDX/W     */
+/*   buffers instead. pc.e is reinterpreted as the SLOT index (0..k-1): */
+/*   the shader does e = idx[pc.e] (and for moe_accum wscale = wt[pc.e]).*/
+/*   Math is otherwise IDENTICAL to the base shader.                    */
+/*   matvec_nvfp4_slot.comp: bindings 0-5 as matvec_nvfp4 + b6 IDX i32  */
+/*   matvec_mxfp8_slot.comp: bindings 0-3 as matvec_mxfp8 + b4 IDX i32  */
+/*   moe_accum_slot.comp:    bindings 0-6 as moe_accum + b7 IDX i32,    */
+/*                           b8 WT f32; pc.wscale unused                */
+/*                                                                    */
 /* moe_accum.comp  local_size_x=64, grid.x = D (2304).                  */
 /*   Fused: a = softcap(gate,gcap)*sigmoid(gate)*softcap(up,ucap) into  */
 /*   shared, then out[r] += wscale * dot(W2[e,r,:], a). Host pre-zeros  */

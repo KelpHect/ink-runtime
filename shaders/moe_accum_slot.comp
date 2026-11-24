@@ -1,0 +1,112 @@
+#version 460
+
+// moe_accum_slot.comp — per-expert finalize (softcapped SwiGLU + weighted
+// down-proj), SLOT-indexed. Identical math to moe_accum.comp; pc.e is a
+// SLOT index into the device-resident router output (IDX/W buffers,
+// bindings 7/8) and the router weight ws = wt[pc.e] is read from memory —
+// required because GpuGraph records the whole token forward once and the
+// expert ids/weights only exist as device data at execution time.
+//
+//   a[mm] = softcap(gate[mm], gcap) * sigmoid(gate[mm]) * softcap(up[mm], ucap)
+//     -- sigmoid sees the RAW gate; softcap bounds only the linear factors
+//   out[r] += ws * dot(W2[e,r,:], a)     (K = I = 1152)
+// with the W2 row dequantized as NVFP4 (quant=0) or MXFP8 (quant=1), matching
+// ops.cpp::expert_dot including the trailing amax[e]/osd[0] factor for NVFP4.
+//
+// Design: grid.x = D output rows (2304). Each workgroup recomputes a[mm] into
+// shared memory (1152 floats). Pre-step per slot (host records): two
+// matvec_nvfp4_slot/mxfp8_slot dispatches on w13 filling GATE/UP for slot s.
+// Host pre-zeros OUT[D] once per MoE block (vkCmdFillBuffer).
+//
+// PC quant: 0 = NVFP4 (packed u8 E2M1 + F8E4M3/16 scales + amax/osd factor),
+//           1 = MXFP8 (F8E4M3 bytes + UE8M0/32 scales; amax/osd unused —
+//           still must be bound, contents ignored).
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer GTBuf { float gt[]; }; // gate [I]
+layout(set = 0, binding = 1, std430) readonly buffer UPBuf { float up[]; }; // up [I]
+layout(set = 0, binding = 2, std430) readonly buffer WBuf  { uint  w[]; };  // W2 packed
+layout(set = 0, binding = 3, std430) readonly buffer SBuf  { uint  s[]; };  // W2 scales
+layout(set = 0, binding = 4, std430) readonly buffer ABuf  { float amax[]; };
+layout(set = 0, binding = 5, std430) readonly buffer O2Buf { float osd[]; };
+layout(set = 0, binding = 6, std430) buffer OBuf           { float o[]; };  // [D] +=
+layout(set = 0, binding = 7, std430) readonly buffer IBuf  { int   idx[]; };// [k] router ids
+layout(set = 0, binding = 8, std430) readonly buffer WtBuf { float wt[]; }; // [k] router w
+
+layout(push_constant) uniform Pc {
+    uint  e;        // SLOT index: e = idx[pc.e], wscale = wt[pc.e]
+    uint  R;        // W2 rows per expert = D (2304)
+    uint  I;        // inner dim = intermediate_size (1152), <= 1152
+    uint  quant;    // 0 = NVFP4, 1 = MXFP8
+    float gcap;     // mlp_gate_softcap = 4.0
+    float ucap;     // mlp_up_softcap   = 25.0
+    float wscale;   // UNUSED in the slot variant (ws comes from wt[pc.e])
+} pc;
+
+shared float red[64];
+shared float a[1152];   // swiglu activation for this expert
+
+const float E2M1[16] = float[16](0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                                 -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0);
+
+float f8e4m3_to_f32(uint v) {
+    uint sgn = v >> 7, ex = (v >> 3) & 0xFu, mn = v & 7u;
+    float x = (ex == 0u) ? ldexp(float(mn) / 8.0, -6)
+                         : ldexp(1.0 + float(mn) / 8.0, int(ex) - 7);
+    return sgn != 0u ? -x : x;
+}
+float softcap(float x, float c) { return c * tanh(x / c); }
+
+void main() {
+    const uint r   = gl_WorkGroupID.x;   // W2 row = output channel
+    const uint tid = gl_LocalInvocationID.x;
+    const uint e   = uint(idx[pc.e]);    // slot -> expert id
+    const float ws = wt[pc.e];           // slot -> router weight
+
+    // phase 1: a[mm] for mm < I (2..18 elems/thread for I=1152)
+    for (uint mm = tid; mm < pc.I; mm += 64u) {
+        float g = gt[mm], u = up[mm];
+        a[mm] = softcap(g, pc.gcap) * (1.0 / (1.0 + exp(-g))) * softcap(u, pc.ucap);
+    }
+    barrier();
+
+    // phase 2: dot(W2[e,r,:], a) over K = I, dequant per pc.quant
+    const uint kv = pc.I;   // K
+    float acc = 0.0;
+    if (pc.quant == 0u) {
+        // NVFP4: 2 E2M1/byte -> row bytes K/2 -> u32 base (e*R+r)*(K>>3); K%64==0
+        const uint wb = (e * pc.R + r) * (kv >> 3);
+        const uint sb = (e * pc.R + r) * (kv >> 6);
+        for (uint k = tid; k < kv; k += 64u) {
+            uint word = w[wb + (k >> 3)];
+            uint bytev = (word >> (((k >> 1) & 3u) * 8u)) & 0xFFu;
+            uint nib = (k & 1u) != 0u ? (bytev >> 4) : (bytev & 0xFu);
+            uint sw = s[sb + (k >> 6)];
+            float bs = f8e4m3_to_f32((sw >> (((k >> 4) & 3u) * 8u)) & 0xFFu);
+            acc += E2M1[nib] * bs * a[k];
+        }
+    } else {
+        // MXFP8: F8E4M3 bytes -> u32 base (e*R+r)*(K>>2); UE8M0/32 -> (K>>7); K%128==0
+        const uint wb = (e * pc.R + r) * (kv >> 2);
+        const uint sb = (e * pc.R + r) * (kv >> 7);
+        for (uint k = tid; k < kv; k += 64u) {
+            float wv = f8e4m3_to_f32((w[wb + (k >> 2)] >> ((k & 3u) * 8u)) & 0xFFu);
+            uint sw = s[sb + (k >> 7)];
+            float bs = ldexp(1.0, int((sw >> (((k >> 5) & 3u) * 8u)) & 0xFFu) - 127);
+            acc += wv * bs * a[k];
+        }
+    }
+
+    red[tid] = acc;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    if (tid == 0u) {
+        float res = red[0];
+        if (pc.quant == 0u) res *= amax[e] / osd[0];  // NVFP4 per-expert factor
+        o[r] += ws * res;
+    }
+}

@@ -9,7 +9,7 @@ import numpy as np
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GOLD = os.path.join(REPO, "testdata", "golden", "visits")
-INK = os.path.join(REPO, "testdata", "ink")
+INK = sys.argv[1] if len(sys.argv) > 1 else os.path.join(REPO, "testdata", "ink")
 
 
 def pair(name):

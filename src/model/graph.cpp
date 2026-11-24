@@ -1,6 +1,8 @@
 #include "graph.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 #include <stdexcept>
@@ -167,6 +169,21 @@ void Graph::reset() {
   for (auto& t : s_.taps) t.clear();
 }
 
+// INK_DBG=1: dump visit0 stage intermediates to testdata/ink_dbg_cpu/dbg*.bin
+// (mirrors GpuGraph's dbg_cp rows for cross-backend bisection).
+static void dbg_dump(int row, const float* x, int n) {
+  if (!std::getenv("INK_DBG")) return;
+  static bool once[16] = {};
+  if (once[row]) return;
+  once[row] = true;
+  char p[256];
+  std::snprintf(p, sizeof p, "testdata/ink_dbg_cpu/dbg%d.bin", row);
+  FILE* f = std::fopen(p, "wb");
+  if (!f) return;
+  std::fwrite(x, 4, size_t(n), f);
+  std::fclose(f);
+}
+
 void Graph::visit(int i, int p, int64_t pos) {
   const ModelConfig& c = *cfg_;
   const int H = int(H_);
@@ -206,6 +223,9 @@ void Graph::visit(int i, int p, int64_t pos) {
   } else {
     std::memcpy(s_.reads.data(), x_in, sizeof(float) * H);
   }
+  if (i == 5)
+    for (int st = 0; st < 3; st++)
+      dbg_dump(st, s_.reads.data() + size_t(st) * H, H);
 
   // --- stream inputs: message gates (pass>0 loop), then sublayer norms ---
   float* in[3] = {s_.xq.data(), s_.xk.data(), s_.xv.data()};
@@ -232,9 +252,13 @@ void Graph::visit(int i, int p, int64_t pos) {
     }
   }
 
+  if (i == 5)
+    for (int st = 0; st < 3; st++) dbg_dump(3 + st, in[st], H);
+
   // --- attention + post-attn conv (stream 2) ---
   ops::attn_step(c, L.attn, L.full, in[0], in[1], in[2], cache, pos,
                  s_.attn_out.data());
+  if (i == 5) dbg_dump(7, s_.attn_out.data(), H);
   ops::sconv4_static(s_.attn_out.data(), L.attn_sconv, cache.conv[2],
                      s_.a_out.data());
 
@@ -245,6 +269,7 @@ void Graph::visit(int i, int p, int64_t pos) {
   } else {
     for (int d = 0; d < H; d++) s_.residual[d] = x_in[d] + s_.a_out[d];
   }
+  if (i == 5) dbg_dump(8, s_.residual.data(), H);
 
   // --- mlp input read ---
   {
@@ -255,6 +280,7 @@ void Graph::visit(int i, int p, int64_t pos) {
     ops::attn_res_read(srcs.data(), int(srcs.size()), s_.qbuf.data(), 1, H,
                        s_.m_in.data());
   }
+  if (i == 5) dbg_dump(9, s_.m_in.data(), H);
   if (msgs)
     ops::msg_gate(L.ctrl[3][0], L.ctrl[3][1], L.ctrl[3][2], s_.m_in.data(),
                   msgs + size_t(3) * H, H, c.loop.gate_rank, s_.m_gated.data());
@@ -262,10 +288,13 @@ void Graph::visit(int i, int p, int64_t pos) {
     std::vector<float> mn(H);
     ops::rmsnorm(msgs ? s_.m_gated.data() : s_.m_in.data(), L.mlp_norm,
                  mn.data(), H, float(c.rms_norm_eps));
+    if (i == 5) dbg_dump(10, mn.data(), H);
     ops::moe_forward(c, L.mlp, mn.data(), s_.moe_out.data());
   }
+  if (i == 5) dbg_dump(11, s_.moe_out.data(), H);
   ops::sconv4_static(s_.moe_out.data(), L.mlp_sconv, cache.conv[3],
                      s_.mo.data());
+  if (i == 5) dbg_dump(12, s_.mo.data(), H);
   for (int d = 0; d < H; d++) s_.partial[d] = s_.residual[d] + s_.mo[d];
   if (visit_hook) visit_hook(vidx, 1, s_.partial);
 }
