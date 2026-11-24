@@ -1,0 +1,42 @@
+#version 460
+
+// matvec_f32_seq.comp — row-batched fp32 GEMV for chunked prefill.
+//
+// Identical math to matvec_f32.comp; gl_WorkGroupID.y is the prompt row t:
+//   out[t*pc.M + m] = sum_k W[m,k] * x[t*pc.xs + k]
+// grid = (M, T).
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer WBuf { float w[]; }; // [R,K] f32
+layout(set = 0, binding = 1, std430) readonly buffer XBuf { float x[]; }; // [T*xs] f32
+layout(set = 0, binding = 2, std430) writeonly buffer OBuf { float o[]; }; // [T,M] f32
+
+layout(push_constant) uniform Pc {
+    uint K;
+    uint m0;
+    uint xs;
+    uint M;
+} pc;
+
+shared float red[64];
+
+void main() {
+    const uint m = pc.m0 + gl_WorkGroupID.x;
+    const uint t = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint base = m * pc.K;
+    const uint xb = t * pc.xs;
+
+    float acc = 0.0;
+    for (uint k = tid; k < pc.K; k += 64u)
+        acc += w[base + k] * x[xb + k];
+
+    red[tid] = acc;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    if (tid == 0u) o[t * pc.M + m] = red[0];
+}

@@ -1,0 +1,40 @@
+#version 460
+
+// attn_accum_seq.comp — batched attention output for chunked prefill.
+//
+// Identical math to attn_accum.comp; query row t accumulates over jj < n
+// (masked columns carry ~0 probability, adding exact zeros).
+//   o[t*HQ*DH + h*DH + d] = sum_jj p[(t*HQ+h)*pstride + jj]
+//                                 * v[jj*HK*DH + g*DH + d]
+// grid = (HQ, T).
+//   b0 ro P[T*HQ*pstride]  b1 ro V[len*HK*DH]  b2 wo O[T*HQ*DH]
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer PBuf  { float p[]; };
+layout(set = 0, binding = 1, std430) readonly buffer VBuf  { float v[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer OBuf { float o[]; };
+
+layout(push_constant) uniform Pc {
+    uint hq;
+    uint hk;
+    uint dh;
+    uint n;        // row width = pos0 + T
+    uint pstride;
+} pc;
+
+void main() {
+    const uint h   = gl_WorkGroupID.x;
+    const uint t   = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint g   = h * pc.hk / pc.hq;
+    const uint pb  = (t * pc.hq + h) * pc.pstride;
+    const uint ob  = t * (pc.hq * pc.dh) + h * pc.dh;
+
+    for (uint d = tid; d < pc.dh; d += 64u) {
+        float acc = 0.0;
+        for (uint jj = 0u; jj < pc.n; jj++)
+            acc += p[pb + jj] * v[jj * (pc.hk * pc.dh) + g * pc.dh + d];
+        o[ob + d] = acc;
+    }
+}

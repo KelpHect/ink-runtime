@@ -1,0 +1,51 @@
+#version 460
+
+// rmsnorm_seq.comp — RMSNorm over strided rows (chunked prefill).
+//
+// Identical math to rmsnorm.comp; the row base is generalized to
+//   x[row * pc.xs + i]  ->  o[row * pc.os + i]
+// so a [T,3,H] tensor can be normed per (row,stream) with xs = 3*H while
+// the destination uses os = 3*H as well, or xs = n for contiguous rows.
+//
+// One workgroup (64 threads) per row: gl_WorkGroupID.x = row index.
+// flags bit0: USE_GAMMA (weighted) vs unweighted.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer XBuf { float x[]; };
+layout(set = 0, binding = 1, std430) readonly buffer GBuf { float g[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer OBuf { float o[]; };
+
+layout(push_constant) uniform Pc {
+    uint  n;
+    float eps;
+    uint  flags;   // bit0: USE_GAMMA
+    uint  xs;      // element stride between input rows
+    uint  os;      // element stride between output rows
+} pc;
+
+shared float red[64];
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const uint xb = row * pc.xs;
+    const uint ob = row * pc.os;
+    const uint tid = gl_LocalInvocationID.x;
+
+    float ss = 0.0;
+    for (uint i = tid; i < pc.n; i += 64u) {
+        float v = x[xb + i];
+        ss += v * v;
+    }
+    red[tid] = ss;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    const float rstd = 1.0 / sqrt(red[0] / float(pc.n) + pc.eps);
+
+    const bool useg = (pc.flags & 1u) != 0u;
+    for (uint i = tid; i < pc.n; i += 64u)
+        o[ob + i] = x[xb + i] * rstd * (useg ? g[i] : 1.0);
+}

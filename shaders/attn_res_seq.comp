@@ -1,0 +1,85 @@
+#version 460
+
+// attn_res_seq.comp — batched learned softmax read (chunked prefill).
+//
+// Identical math to attn_res.comp; gl_WorkGroupID.x is the prompt row t.
+// Sources for row t sit at src[t*pc.ss + s*D] (s < N); outputs go to
+// out[t*pc.os + qi*D]. Queries are shared across rows (per-visit tables).
+//   xn_s = src_s * rstd_s, rstd_s = 1/sqrt(mean(src_s^2)+1e-6)
+//   p = softmax(q . xn_s / sqrt(D));  out[q] = sum_s p_s*rstd_s*src_s
+//   b0 ro SRC[T*ss]  b1 ro Q[Q*D]  b2 wo OUT[T*os]
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer SBuf { float src[]; };
+layout(set = 0, binding = 1, std430) readonly buffer QBuf { float q[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer OBuf { float o[]; };
+
+layout(push_constant) uniform Pc {
+    uint N;    // number of sources
+    uint D;    // vector dim (2304)
+    uint Q;    // query rows (1, 3, or 4)
+    uint ss;   // source row stride (elements)
+    uint os;   // output row stride (elements)
+} pc;
+
+shared float red[64];
+shared float rstd[16];
+shared float prob[16];
+
+float wg_sum(float v) {
+    barrier();
+    red[gl_LocalInvocationID.x] = v;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if (gl_LocalInvocationID.x < s)
+            red[gl_LocalInvocationID.x] += red[gl_LocalInvocationID.x + s];
+        barrier();
+    }
+    return red[0];
+}
+
+void main() {
+    const uint t   = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint sb  = t * pc.ss;
+    const uint ob  = t * pc.os;
+    const float scale = 1.0 / sqrt(float(pc.D));
+
+    for (uint s = 0u; s < pc.N; s++) {
+        float ss = 0.0;
+        for (uint d = tid; d < pc.D; d += 64u) {
+            float v = src[sb + s * pc.D + d];
+            ss += v * v;
+        }
+        float tot = wg_sum(ss);
+        if (tid == 0u) rstd[s] = 1.0 / sqrt(tot / float(pc.D) + 1e-6);
+    }
+    barrier();
+
+    for (uint qi = 0u; qi < pc.Q; qi++) {
+        const uint qb = qi * pc.D;
+        for (uint s = 0u; s < pc.N; s++) {
+            float acc = 0.0;
+            for (uint d = tid; d < pc.D; d += 64u)
+                acc += q[qb + d] * src[sb + s * pc.D + d];
+            float tot = wg_sum(acc);
+            if (tid == 0u) prob[s] = tot * rstd[s] * scale;
+        }
+        if (tid == 0u) {
+            float m = prob[0];
+            for (uint s = 1u; s < pc.N; s++) m = max(m, prob[s]);
+            float z = 0.0;
+            for (uint s = 0u; s < pc.N; s++) { prob[s] = exp(prob[s] - m); z += prob[s]; }
+            for (uint s = 0u; s < pc.N; s++) prob[s] /= z;
+        }
+        barrier();
+        for (uint d = tid; d < pc.D; d += 64u) {
+            float acc = 0.0;
+            for (uint s = 0u; s < pc.N; s++)
+                acc += prob[s] * rstd[s] * src[sb + s * pc.D + d];
+            o[ob + qb + d] = acc;
+        }
+        barrier();
+    }
+}

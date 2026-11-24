@@ -56,7 +56,8 @@ if(INK_WITH_VULKAN)
     src/vk/cmd.cpp
     src/vk/pipe.cpp
     src/gpu/vk_backend.cpp
-    src/gpu/gpu_graph.cpp)
+    src/gpu/gpu_graph.cpp
+    src/gpu/gpu_prefill.cpp)
   target_include_directories(inkcore PUBLIC ${CMAKE_SOURCE_DIR}/shaders)
 
   # Compile shaders/*.comp -> ${CMAKE_BINARY_DIR}/shaders/<name>.spv.

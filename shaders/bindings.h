@@ -316,4 +316,20 @@ struct PcL2ClipSeq { uint32_t dim; float thr; uint32_t flags, hstride; };
 /*   v[gid] *= tau[gid / n]  (tau buffer bound at b1, host-computed)   */
 struct PcLogScaleSeq { uint32_t n, total, pos0; };
 
+/* ================================================================== */
+/* STAGE VARIANTS (GpuGraph host-resident expert staging):            */
+/*   Clones of the *_mslot kernels for layers whose expert tensors    */
+/*   stayed host-visible at init. The selected experts' slices are    */
+/*   copied per top-k slot into device-local staging buffers          */
+/*   (vkCmdCopyBuffer), so the packed weight/scale row bases index    */
+/*   by SLOT (slot*R + r) instead of expert id (e*R + r). The expert  */
+/*   id e = idx[slot] is still read for the nvfp4 amax[e]/osd[0]      */
+/*   factor only; IDX stays bound on mxfp8 for layout parity.         */
+/*   Push constants, binding order and grids are IDENTICAL to the     */
+/*   mslot variants — PcNvfp4 / PcMxfp8 / PcMoeAccum as above with    */
+/*   pc.e unused (0).                                                 */
+/*   matvec_nvfp4_stage.comp: bindings 0-6 as matvec_nvfp4_mslot      */
+/*   matvec_mxfp8_stage.comp: bindings 0-4 as matvec_mxfp8_mslot      */
+/*   moe_accum_stage.comp:    bindings 0-8 as moe_accum_mslot         */
+
 }  // namespace ink::shaders

@@ -1,0 +1,33 @@
+#version 460
+
+// rel_bias_seq.comp — batched per-head relative-position bias profiles.
+//
+// Identical math to rel_bias.comp; gl_WorkGroupID.y is the prompt row t:
+//   rel[t*n + h*ext + d] = sum_e r[t*(HQ*dr) + h*dr + e] * proj[e*ext + d]
+// grid = (ceil(HQ*ext/64), T).
+//   b0 ro R[T*HQ*dr]  b1 ro PROJ[dr*ext]  b2 wo REL[T*HQ*ext]
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer RBuf   { float r[]; };
+layout(set = 0, binding = 1, std430) readonly buffer PJBuf  { float proj[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer RLBuf { float rel[]; };
+
+layout(push_constant) uniform Pc {
+    uint dr;
+    uint ext;
+    uint n;      // HQ*ext (row width)
+} pc;
+
+void main() {
+    const uint gid = gl_WorkGroupID.x * 64u + gl_LocalInvocationID.x;
+    if (gid >= pc.n) return;
+    const uint t  = gl_WorkGroupID.y;
+    const uint h  = gid / pc.ext;
+    const uint d  = gid % pc.ext;
+    const uint rb = t * ((pc.n / pc.ext) * pc.dr);   // t * HQ * dr
+    float acc = 0.0;
+    for (uint e = 0u; e < pc.dr; e++)
+        acc += r[rb + h * pc.dr + e] * proj[e * pc.ext + d];
+    rel[t * pc.n + gid] = acc;
+}

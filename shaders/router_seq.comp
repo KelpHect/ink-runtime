@@ -1,0 +1,63 @@
+#version 460
+
+// router_seq.comp — batched MoE router (chunked prefill).
+//
+// Identical math to router.comp; gl_WorkGroupID.x is the prompt row t:
+//   logits[i] = gw[i,:] . x[t*K + :];  score = sigmoid;  sel = score + bias
+//   keep k largest sel -> idx[t*k + rank]; w = raw scores renormed * scale.
+//   b0 ro GW[E*K]  b1 ro GB[E]  b2 ro X[T*K]  b3 wo IDX[T*k]  b4 rw W[T*k]
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer GWBuf { float gw[]; };
+layout(set = 0, binding = 1, std430) readonly buffer GBBuf { float gb[]; };
+layout(set = 0, binding = 2, std430) readonly buffer XBuf  { float x[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer IBuf { int   idx[]; };
+layout(set = 0, binding = 4, std430) buffer WBuf           { float w[]; };
+
+layout(push_constant) uniform Pc {
+    uint  n_experts;
+    uint  k;
+    uint  K;
+    float route_scale;
+} pc;
+
+shared float sel[128];
+shared float scr[128];
+
+void main() {
+    const uint t = gl_WorkGroupID.x;
+    const uint e = gl_LocalInvocationID.x;
+    const uint xb = t * pc.K;
+    const uint ib = t * pc.k;
+
+    if (e < pc.n_experts) {
+        float acc = 0.0;
+        const uint base = e * pc.K;
+        for (uint j = 0u; j < pc.K; j++) acc += gw[base + j] * x[xb + j];
+        float sc = 1.0 / (1.0 + exp(-acc));
+        scr[e] = sc;
+        sel[e] = sc + gb[e];
+    }
+    barrier();
+
+    if (e < pc.n_experts) {
+        const float se = sel[e];
+        uint rank = 0u;
+        for (uint j = 0u; j < pc.n_experts; j++) {
+            float sj = sel[j];
+            if (sj > se || (sj == se && j < e)) rank++;
+        }
+        if (rank < pc.k) {
+            idx[ib + rank] = int(e);
+            w[ib + rank] = scr[e];
+        }
+    }
+    barrier();
+
+    if (gl_LocalInvocationID.x == 0u) {
+        float sum = 0.0;
+        for (uint i = 0u; i < pc.k; i++) sum += w[ib + i];
+        for (uint i = 0u; i < pc.k; i++) w[ib + i] = w[ib + i] / (sum + 1e-20) * pc.route_scale;
+    }
+}

@@ -1,0 +1,53 @@
+#version 460
+
+// attn_softmax_seq.comp — batched softmax over score rows + per-head sink.
+//
+// Identical math to attn_softmax.comp; the row is (t*hq + h) at
+// p[(t*hq+h)*pstride + j], j in [0,n). Masked (-1e30) columns contribute
+// exactly 0. Sink logit from sink[t*hq + h]; its prob is stored at index n.
+//
+// grid = (HQ, T).
+//   b0 rw P[T*HQ*pstride]   b1 ro SINK[T*HQ]
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) buffer PBuf            { float p[]; };
+layout(set = 0, binding = 1, std430) readonly buffer SKBuf  { float sink[]; };
+
+layout(push_constant) uniform Pc {
+    uint n;        // row width = pos0 + T
+    uint pstride;  // = n+1
+    uint hq;
+} pc;
+
+shared float red[64];
+
+void main() {
+    const uint h   = gl_WorkGroupID.x;
+    const uint t   = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint base = (t * pc.hq + h) * pc.pstride;
+    const float sk = sink[t * pc.hq + h];
+
+    float mx = sk;
+    for (uint j = tid; j < pc.n; j += 64u) mx = max(mx, p[base + j]);
+    red[tid] = mx; barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if (tid < s) red[tid] = max(red[tid], red[tid + s]);
+        barrier();
+    }
+    const float m = red[0];
+    barrier();
+
+    float es = 0.0;
+    for (uint j = tid; j < pc.n; j += 64u) es += exp(p[base + j] - m);
+    red[tid] = es; barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    const float z = red[0] + exp(sk - m);
+
+    for (uint j = tid; j < pc.n; j += 64u) p[base + j] = exp(p[base + j] - m) / z;
+    if (tid == 0u) p[base + pc.n] = exp(sk - m) / z;
+}

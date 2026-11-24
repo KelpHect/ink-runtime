@@ -1,0 +1,26 @@
+#version 460
+
+// log_scale_seq.comp — per-row log-scaling multiply (full-attn layers).
+//
+// Row t gets its own tau[t] (host-computed in double, matching the CPU
+//   tau = 1 + alpha*log(max((pos+1)/n_floor, 1)) exactly).
+//   v[gid] *= tau[pos0 + gid / n]
+// grid = ceil(T*n / 64).
+//   b0 rw V[T*n]  b1 ro TAU[P] (indexed by absolute-ish position base+row)
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) buffer VBuf           { float v[]; };
+layout(set = 0, binding = 1, std430) readonly buffer TBuf  { float tau[]; };
+
+layout(push_constant) uniform Pc {
+    uint n;      // elements per row
+    uint total;  // T*n (guard for the tail workgroup)
+    uint pos0;   // staging-relative index of this chunk's row 0
+} pc;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.total) return;
+    v[i] *= tau[pc.pos0 + i / pc.n];
+}

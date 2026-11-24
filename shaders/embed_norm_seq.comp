@@ -1,0 +1,49 @@
+#version 460
+
+// embed_norm_seq.comp — row-batched embedding gather + RMSNorm for chunked
+// prefill: out[row] = rmsnorm(embed[toks[pc.base + row]]).
+//
+// Identical math to embed_norm.comp; the only difference is the token id is
+// read from a device-visible TOKS buffer at position base+row instead of a
+// literal push constant (ids for the whole chunk ride in one buffer).
+//
+// grid.x = T rows. n = hidden = 2304. EMB is a u32 array: F32 raw bits or
+// BF16 2-per-u32 (flags bit0), as embed_norm.comp.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer EBuf { uint  e[]; }; // [V,n] packed
+layout(set = 0, binding = 1, std430) readonly buffer TBuf { int   toks[]; };
+layout(set = 0, binding = 2, std430) readonly buffer GBuf { float g[]; }; // [n] gamma
+layout(set = 0, binding = 3, std430) writeonly buffer OBuf { float o[]; };// [T,n]
+
+layout(push_constant) uniform Pc {
+    uint  base;    // first prompt position of the chunk
+    uint  n;
+    float eps;
+    uint  flags;   // bit0: SRC_BF16
+} pc;
+
+shared float red[64];
+shared float rstd;
+
+float emb_at(uint tok, uint d) {
+    if ((pc.flags & 1u) != 0u) {
+        uint idx = tok * pc.n + d;
+        return uintBitsToFloat(((e[idx >> 1] >> ((idx & 1u) * 16u)) & 0xFFFFu) << 16);
+    }
+    return uintBitsToFloat(e[tok * pc.n + d]);
+}
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const uint tok = uint(toks[pc.base + row]);
+    const uint tid = gl_LocalInvocationID.x;
+    float ss = 0.0;
+    for (uint d = tid; d < pc.n; d += 64u) { float v = emb_at(tok, d); ss += v * v; }
+    red[tid] = ss; barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) { if (tid < s) red[tid] += red[tid + s]; barrier(); }
+    if (tid == 0u) rstd = 1.0 / sqrt(red[0] / float(pc.n) + pc.eps);
+    barrier();
+    for (uint d = tid; d < pc.n; d += 64u) o[row * pc.n + d] = emb_at(tok, d) * rstd * g[d];
+}

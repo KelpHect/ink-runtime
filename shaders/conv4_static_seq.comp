@@ -1,0 +1,69 @@
+#version 460
+
+// conv4_static_seq.comp — causal depthwise conv4 batched over T prompt rows.
+//
+// Identical math to conv4_static.comp per row. The 3-input history that the
+// single-token shader keeps in HIST[c*3+i] = x[t-1-i] is replaced by a
+// ROW-MAJOR buffer H3[3*C]: h3[j*C+c] = raw input of position pos0-3+j
+// (h3[2] = most recent). Row t reads x[(t-lag)*C+c] for t-lag >= 0 and
+// h3[(3+t-lag)*C+c] for t-lag < 0; zeros in h3 reproduce the cold-start
+// `filled` gating exactly.
+//
+// Two dispatches per conv:
+//   flags = 0           grid (ceil(C/64), T) : compute OUT rows.
+//   flags = F_SEQ_STATE grid (ceil(C/64), 1) : h3 shift + optional HIST export.
+// The state pass reads x and old h3 then writes h3 — one thread per channel,
+// read-then-write in order, so no race.
+//   F_SEQ_EXPORT additionally writes the channel-major decode hist
+//   (hist[c*3+i] = x[pos0+T-1-i]) so the single-token path can continue.
+//
+//   b0 ro X[T*C]  b1 ro W[C*4]  b2 rw H3[3*C]  b3 wo OUT[T*C]  b4 wo HIST[C*3]
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer XBuf  { float x[]; };
+layout(set = 0, binding = 1, std430) readonly buffer WBuf  { float w[]; };
+layout(set = 0, binding = 2, std430) buffer HBuf           { float h3[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer OBuf { float o[]; };
+layout(set = 0, binding = 4, std430) writeonly buffer H2Buf{ float hist[]; };
+
+layout(push_constant) uniform Pc {
+    uint C;
+    uint T;
+    uint flags;    // bit1: STATE pass; bit2: EXPORT decode hist
+} pc;
+
+const float INV_SQRT5 = 0.4472135954999579;
+
+// raw input at chunk-relative row g (negative -> previous chunk history)
+float xin(int g, uint c) {
+    return g >= 0 ? x[uint(g) * pc.C + c] : h3[uint(3 + g) * pc.C + c];
+}
+
+void main() {
+    const uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.C) return;
+
+    if ((pc.flags & 2u) == 0u) {
+        // ---- compute pass: row t = gl_WorkGroupID.y ----
+        const uint t = gl_WorkGroupID.y;
+        const float xv = x[t * pc.C + c];
+        float acc = w[c * 4u + 3u] * xv;
+        acc += w[c * 4u + 2u] * xin(int(t) - 1, c);
+        acc += w[c * 4u + 1u] * xin(int(t) - 2, c);
+        acc += w[c * 4u + 0u] * xin(int(t) - 3, c);
+        o[t * pc.C + c] = (acc + xv) * INV_SQRT5;
+        return;
+    }
+
+    // ---- state pass: shift h3, optionally export channel-major hist ----
+    float nh[3];
+    for (uint j = 0u; j < 3u; j++)
+        nh[j] = xin(int(pc.T) - 3 + int(j), c);
+    for (uint j = 0u; j < 3u; j++)
+        h3[j * pc.C + c] = nh[j];
+    if ((pc.flags & 4u) != 0u) {
+        for (uint i = 0u; i < 3u; i++)
+            hist[c * 3u + i] = nh[2u - i];
+    }
+}

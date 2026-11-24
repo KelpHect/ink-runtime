@@ -1,0 +1,42 @@
+#version 460
+
+// l2_clip_seq.comp — batched per-head L2 norm clip (chunked prefill).
+//
+// Identical math to l2_clip.comp; gl_WorkGroupID.y is the prompt row t:
+//   head h of row t lives at v[t*pc.hstride + h*pc.dim + d].
+// The optional learned scale is shared across rows: sc[h*dim + d].
+// grid = (heads, T). flags bit0: USE_SCALE.
+//   b0 rw V[T*hstride]  b1 ro SCALE[heads*dim]
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) buffer VBuf           { float v[]; };
+layout(set = 0, binding = 1, std430) readonly buffer SBuf  { float sc[]; };
+
+layout(push_constant) uniform Pc {
+    uint  dim;
+    float thr;
+    uint  flags;    // bit0: USE_SCALE
+    uint  hstride;  // elements per row (heads*dim)
+} pc;
+
+shared float red[64];
+
+void main() {
+    const uint h   = gl_WorkGroupID.x;
+    const uint t   = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint base = t * pc.hstride + h * pc.dim;
+    const uint sbase = h * pc.dim;
+
+    if ((pc.flags & 1u) != 0u) {
+        for (uint d = tid; d < pc.dim; d += 64u) v[base + d] *= sc[sbase + d];
+        barrier();
+    }
+    float ss = 0.0;
+    for (uint d = tid; d < pc.dim; d += 64u) { float x = v[base + d]; ss += x * x; }
+    red[tid] = ss; barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) { if (tid < s) red[tid] += red[tid + s]; barrier(); }
+    const float scl = min(1.0, pc.thr / (sqrt(red[0]) + 1e-6));
+    for (uint d = tid; d < pc.dim; d += 64u) v[base + d] *= scl;
+}

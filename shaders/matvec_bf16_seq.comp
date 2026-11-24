@@ -1,0 +1,48 @@
+#version 460
+
+// matvec_bf16_seq.comp — row-batched bf16 GEMV for chunked prefill.
+//
+// Identical math to matvec_bf16.comp; gl_WorkGroupID.y is the prompt row t:
+//   out[t*pc.M + m] = sum_k bf16(W[m,k]) * x[t*pc.xs + k]
+// x row stride pc.xs covers strided streams (e.g. [T,3,H] with xs = 3H).
+// grid = (M, T). K even (row u32 alignment), as the base shader.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer WBuf { uint w[]; }; // [M,K] bf16 packed 2/u32
+layout(set = 0, binding = 1, std430) readonly buffer XBuf { float x[]; }; // [T*xs] f32
+layout(set = 0, binding = 2, std430) writeonly buffer OBuf { float o[]; }; // [T,M] f32
+
+layout(push_constant) uniform Pc {
+    uint K;
+    uint m0;
+    uint xs;   // element stride between input rows
+    uint M;    // output row stride (= total output rows per t)
+} pc;
+
+shared float red[64];
+
+float bf16_at(uint elem) {
+    uint u = w[elem >> 1] >> ((elem & 1u) * 16u);
+    return uintBitsToFloat((u & 0xFFFFu) << 16);
+}
+
+void main() {
+    const uint m = pc.m0 + gl_WorkGroupID.x;
+    const uint t = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint base = m * pc.K;
+    const uint xb = t * pc.xs;
+
+    float acc = 0.0;
+    for (uint k = tid; k < pc.K; k += 64u)
+        acc += bf16_at(base + k) * x[xb + k];
+
+    red[tid] = acc;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    if (tid == 0u) o[t * pc.M + m] = red[0];
+}

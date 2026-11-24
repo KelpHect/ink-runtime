@@ -1,0 +1,59 @@
+#version 460
+
+// conv4_dynamic_seq.comp — batched input-conditioned conv4 (full-attn layers).
+//
+// Identical math to conv4_dynamic.comp per row; the dynamic taps are per
+// prompt row: dyn[t*32 + h*4 + lag] where t = gl_WorkGroupID.y. History via
+// the row-major H3 buffer exactly as conv4_static_seq.
+//
+//   b0 ro X[T*C]  b1 ro SW[4*C]  b2 ro DYN[T*32]
+//   b3 rw H3[3*C]  b4 wo OUT[T*C]  b5 wo HIST[C*3]
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer XBuf  { float x[]; };
+layout(set = 0, binding = 1, std430) readonly buffer SBuf  { float sw[]; };
+layout(set = 0, binding = 2, std430) readonly buffer DBuf  { float dyn[]; };
+layout(set = 0, binding = 3, std430) buffer HBuf           { float h3[]; };
+layout(set = 0, binding = 4, std430) writeonly buffer OBuf { float o[]; };
+layout(set = 0, binding = 5, std430) writeonly buffer H2Buf{ float hist[]; };
+
+layout(push_constant) uniform Pc {
+    uint C;
+    uint head_dim;
+    uint T;
+    uint flags;    // bit1: STATE pass; bit2: EXPORT decode hist
+} pc;
+
+const float INV3 = 0.3333333333333333;
+
+float xin(int g, uint c) {
+    return g >= 0 ? x[uint(g) * pc.C + c] : h3[uint(3 + g) * pc.C + c];
+}
+
+void main() {
+    const uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.C) return;
+
+    if ((pc.flags & 2u) == 0u) {
+        const uint t = gl_WorkGroupID.y;
+        const uint hh = (c / pc.head_dim) * 4u + t * 32u;   // dyn base for row
+        const float xv = x[t * pc.C + c];
+        float acc = (sw[0u * pc.C + c] + dyn[hh + 0u]) * xv;
+        acc += (sw[1u * pc.C + c] + dyn[hh + 1u]) * xin(int(t) - 1, c);
+        acc += (sw[2u * pc.C + c] + dyn[hh + 2u]) * xin(int(t) - 2, c);
+        acc += (sw[3u * pc.C + c] + dyn[hh + 3u]) * xin(int(t) - 3, c);
+        o[t * pc.C + c] = (acc + xv) * INV3;
+        return;
+    }
+
+    float nh[3];
+    for (uint j = 0u; j < 3u; j++)
+        nh[j] = xin(int(pc.T) - 3 + int(j), c);
+    for (uint j = 0u; j < 3u; j++)
+        h3[j * pc.C + c] = nh[j];
+    if ((pc.flags & 4u) != 0u) {
+        for (uint i = 0u; i < 3u; i++)
+            hist[c * 3u + i] = nh[2u - i];
+    }
+}

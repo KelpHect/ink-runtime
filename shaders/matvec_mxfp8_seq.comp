@@ -1,0 +1,70 @@
+#version 460
+
+// matvec_mxfp8_seq.comp — batched expert GEMV over MXFP8, slot-indexed.
+//
+// Identical math to matvec_mxfp8_slot.comp; gl_WorkGroupID.y is the prompt
+// row t: e = idx[t*pc.ktop + pc.e]; x = X + t*K;
+//   out[(t*pc.ktop + pc.e)*pc.M + m] = acc * pc.wscale
+// grid = (M, T). K % 128 == 0 (u32 scale-row alignment), as the base shader.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer WBuf  { uint  w[]; };
+layout(set = 0, binding = 1, std430) readonly buffer SBuf  { uint  s[]; };
+layout(set = 0, binding = 2, std430) readonly buffer XBuf  { float x[]; };
+layout(set = 0, binding = 3, std430) buffer OBuf2          { float o[]; };
+layout(set = 0, binding = 4, std430) readonly buffer IBuf  { int   idx[]; };
+
+layout(push_constant) uniform Pc {
+    uint  e;
+    uint  R;
+    uint  K;
+    uint  row0;
+    uint  row_stride;
+    float wscale;
+    uint  flags;
+    uint  ktop;
+    uint  M;
+} pc;
+
+shared float red[64];
+
+float f8e4m3_to_f32(uint v) {
+    uint s = v >> 7, e = (v >> 3) & 0xFu, m = v & 7u;
+    float x = (e == 0u) ? ldexp(float(m) / 8.0, -6)
+                        : ldexp(1.0 + float(m) / 8.0, int(e) - 7);
+    return s != 0u ? -x : x;
+}
+
+void main() {
+    const uint m = gl_WorkGroupID.x;
+    const uint t = gl_WorkGroupID.y;
+    const uint r = pc.row0 + m * pc.row_stride;
+    const uint e = uint(idx[t * pc.ktop + pc.e]);
+    const uint tid = gl_LocalInvocationID.x;
+
+    const uint wr_base = (e * pc.R + r) * (pc.K >> 2);
+    const uint sc_base = (e * pc.R + r) * (pc.K >> 7);
+    const uint xb = t * pc.K;
+
+    float acc = 0.0;
+    for (uint k = tid; k < pc.K; k += 64u) {
+        uint word = w[wr_base + (k >> 2)];
+        float wv = f8e4m3_to_f32((word >> ((k & 3u) * 8u)) & 0xFFu);
+        uint sw = s[sc_base + (k >> 7)];
+        float bs = ldexp(1.0, int((sw >> (((k >> 5) & 3u) * 8u)) & 0xFFu) - 127);
+        acc += wv * bs * x[xb + k];
+    }
+
+    red[tid] = acc;
+    barrier();
+    for (uint st = 32u; st > 0u; st >>= 1) {
+        if (tid < st) red[tid] += red[tid + st];
+        barrier();
+    }
+    if (tid == 0u) {
+        const uint ob = (t * pc.ktop + pc.e) * pc.M + m;
+        if ((pc.flags & 1u) != 0u) o[ob] += pc.wscale * red[0];
+        else                       o[ob] = pc.wscale * red[0];
+    }
+}

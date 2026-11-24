@@ -5,6 +5,7 @@
 #include "model/graph.h"
 #ifdef INK_WITH_VULKAN
 #include "gpu/gpu_graph.h"
+#include "gpu/gpu_prefill.h"
 #include "gpu/vk_backend.h"
 #endif
 
@@ -86,7 +87,8 @@ int main(int argc, char** argv) {
     std::fprintf(stderr,
                  "usage: ink <model_dir> [--prompt \"...\"] [--tokens N] "
                  "[--ctx N] [--token-ids a,b,c] [--dump dir] "
-                 "[--backend cpu|vk|gpu] [--shader-dir dir]\n");
+                 "[--backend cpu|vk|gpu] [--shader-dir dir] "
+                 "[--prefill-chunk N]\n");
     return 1;
   }
   std::string dir = argv[1];
@@ -101,6 +103,7 @@ int main(int argc, char** argv) {
 #endif
   int gen_tokens = 8;
   int ctx = 4096;
+  int prefill_chunk = 0;  // >0: gpu batched-chunk prefill rows per chunk
   std::vector<int> ids;
   for (int i = 2; i < argc; i++) {
     auto need = [&](const char* flag) -> const char* {
@@ -117,6 +120,8 @@ int main(int argc, char** argv) {
       shader_dir = need("--shader-dir");
     else if (!std::strcmp(argv[i], "--tokens")) gen_tokens = atoi(need("--tokens"));
     else if (!std::strcmp(argv[i], "--ctx")) ctx = atoi(need("--ctx"));
+    else if (!std::strcmp(argv[i], "--prefill-chunk"))
+      prefill_chunk = atoi(need("--prefill-chunk"));
     else if (!std::strcmp(argv[i], "--token-ids")) {
       std::string s = need("--token-ids");
       size_t p = 0;
@@ -176,6 +181,7 @@ int main(int argc, char** argv) {
   ink::vk::Allocator vkalloc;
   ink::gpu::VkBackend vk_backend;
   ink::gpu::GpuGraph gpu_graph;
+  ink::gpu::GpuPrefill gpu_prefill;
   const bool gpu_mode = backend == "gpu";
   if (backend == "vk") {
     if (!vk_backend.init(shader_dir, err)) {
@@ -199,6 +205,13 @@ int main(int argc, char** argv) {
     }
     std::printf("backend: gpu (shader-dir %s, ctx %d)\n", shader_dir.c_str(),
                 ctx);
+    if (prefill_chunk > 0) {
+      if (!gpu_prefill.init(gpu_graph, prefill_chunk, &err)) {
+        std::fprintf(stderr, "gpu prefill: %s\n", err.c_str());
+        return 1;
+      }
+      std::printf("prefill: chunked gpu (T=%d)\n", gpu_prefill.chunk());
+    }
   } else
 #endif
   {
@@ -294,7 +307,38 @@ int main(int argc, char** argv) {
 
   int64_t pos = 0;
   size_t ip = 0;
+  bool prefilled = false;
+#ifdef INK_WITH_VULKAN
+  if (gpu_mode && prefill_chunk > 0 && ids.size() > 1) {
+    // Batched-chunk prompt prefill: all P positions through all 48 visits
+    // in T-row chunks inside a handful of submissions. Leaves kv/conv/readback
+    // state identical to P sequential forward_token calls.
+    const auto pw0 = std::chrono::steady_clock::now();
+    gpu_graph.reset();
+    if (!gpu_prefill.prefill(ids.data(), int64_t(ids.size()))) {
+      std::fprintf(stderr,
+                   "prefill failed (%s); falling back to per-token\n",
+                   gpu_prefill.error().c_str());
+      gpu_graph.reset();
+    } else {
+      prefilled = true;
+      pos = int64_t(ids.size());
+      cur_step = 0;
+      const std::vector<float>& lg = gpu_graph.logits();
+      int am = ops::argmax(lg.data(), int(lg.size()));
+      std::printf("pos %lld prefill -> argmax %d\n", (long long)(pos - 1),
+                  am);
+      if (!dump_dir.empty()) dump_all(0);
+      const double pw = std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - pw0)
+                            .count();
+      std::printf("prefill wall: %.2fs for %zu tokens (%.1f tok/s)\n", pw,
+                  ids.size(), ids.size() / std::max(pw, 1e-9));
+    }
+  }
+#endif
   for (int t : ids) {
+    if (prefilled) break;
     if (++ip == ids.size()) cur_step = 0;  // tag last prompt token as step0
     forward(t, pos++);
     const std::vector<float>& lg = last_logits();
