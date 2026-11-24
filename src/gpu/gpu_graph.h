@@ -15,9 +15,14 @@
 #include "vk/vk.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+namespace ink::shaders {
+struct GpuParamsRow;  // bindings.h — defined at include site in the .cpp
+}
 
 namespace ink::gpu {
 
@@ -42,11 +47,15 @@ class GpuGraph {
   const std::vector<float>& logits() const { return logits_host_; }
 
   // Golden-gate readback (valid until the next forward_token):
-  //   tap(0..2) = visit-input hidden at vidx {5,23,41}; tap(3) = h_fin.
+  //   tap(0..2) = visit-input hidden at vidx {5,23,41}; tap(3) = h_fin
+  //   (final normed — spec: "id 48 = the final normed output").
   //   visit_dump(vidx, 0/1) = partial at visit input/output (48 visits).
   const float* tap(int i) const;
   const float* visit_dump(int vidx, int phase) const;
   const float* dbg(int row) const;  // visit0 stage dump rows (debug)
+  // Raw bf16 unembed SSBO (model.llm.unembed.weight bytes) — shared
+  // read-only with the MTP draft head so it needs no 883MB second copy.
+  const ink::vk::Buffer& unembed_buffer() const { return unembw_; }
 
   struct Stats {
     uint64_t submits = 0, dispatches = 0, copies = 0, barriers = 0;
@@ -123,11 +132,30 @@ class GpuGraph {
           VkDeviceSize dof, VkDeviceSize sz, const char* tag = nullptr);
   void fill(const ink::vk::Buffer& d, VkDeviceSize off, VkDeviceSize sz,
             uint32_t data, const char* tag = nullptr);
+  // cpr: one vkCmdCopyBuffer carrying a region array (per-tensor batches
+  // for the staged expert-slice copies — fewer driver packets).
+  void cpr(const ink::vk::Buffer& s, const ink::vk::Buffer& d,
+           const VkBufferCopy* regs, uint32_t n, const char* tag = nullptr);
   void sync();  // full pipeline barrier (correctness-first)
   Bnd histb(int slot, int stream, int C) const;
   Bnd kvb(const ink::vk::Buffer& cache, int slot) const;
 
   void emit_token(int token, int64_t pos);
+  // Record-once decode: walk emit_token once at init, recording per-segment
+  // persistent command buffers (a segment boundary sits between a staged
+  // visit's a() — ending in the router-id readback — and its b()). Every
+  // recorded argument is token-invariant; per-token scalars ride in the
+  // params_ rows the shaders read (see shaders/bindings.h PARAMS ROWS).
+  bool record_segments();
+  void write_params(int token, int64_t pos);  // params rows + counter advance
+  // row stride honors minStorageBufferOffsetAlignment (>= 64B rows)
+  Bnd prm_b(int slot) const {
+    return {&params_, VkDeviceSize(slot) * prm_stride_, 64};
+  }
+  Bnd prm_head() const { return {&params_, VkDeviceSize(48) * prm_stride_, 64}; }
+  ink::shaders::GpuParamsRow* prm_row(int i) const {
+    return (ink::shaders::GpuParamsRow*)((char*)prm_ + size_t(i) * prm_stride_);
+  }
   // Per-visit split (host-resident expert staging): emit_visit_a covers the
   // visit head through the router plus a 32B copy of ridx_ into the readback
   // ids region; emit_visit_b is the MoE tail (staged copies, fill, expert
@@ -136,14 +164,19 @@ class GpuGraph {
   // walks — record just submits between them so the host can read the
   // freshly routed expert ids and program visit v's slice copies.
   void emit_visit_a(int i, int p, int64_t pos);
-  void emit_visit_b(int i, int p);
+  // part: 0 = whole MoE tail; 1 = w13 phase (moe_zero + gate/up GEMVs —
+  // consumes the w13 slices); 2 = w2 phase onward (accum..out_add — waits
+  // on the w2 slices). Parts only differ for staged visits in the
+  // two-phase path; every other call is part 0.
+  void emit_visit_b(int i, int p, int part = 0);
   void emit_head(int token, int64_t pos);  // nblock reset + embed
   void emit_snap();                        // prelude snapshot (pre_* buffers)
   void emit_bank(int p);                   // pass-p loop-state restore
   void emit_fin();                         // final attn_res + norm + logits
   // Record-mode helper: 4 vkCmdCopyBuffer slices per top-k slot for one
-  // host-resident layer (32 copies; no-ops while building_).
-  void stage_copies(const Lw& L);
+  // host-resident layer (32 copies; no-ops while building_). part 0 = all
+  // four tensors, 1 = w13 weight+scale only, 2 = w2 weight+scale only.
+  void stage_copies(const Lw& L, int part);
 
   const ModelConfig* cfg_ = nullptr;
   ink::vk::Context* ctx_ = nullptr;
@@ -190,12 +223,34 @@ class GpuGraph {
       p_acc_, p_ares_, p_msg_, p_rtr_, p_moe_, p_mred_, p_moem_, p_nv4m_, p_mx8m_,
       p_sig_, p_cap_, p_add_, p_l2_,
       p_log_, p_emb_, p_nv4s_, p_mx8s_,
-      p_nv4st_, p_mx8st_, p_moest_;  // *_stage variants (slot-indexed stg_*)
+      p_nv4st_, p_mx8st_, p_moest_,  // *_stage variants (slot-indexed stg_*)
+      p_kva_;                      // kv_append (device-driven kv dst offset)
 
   std::vector<ink::vk::DescSet> sites_;  // binding stream, built once
   size_t site_cursor_ = 0;
   bool building_ = false;
   ink::vk::Recorder* rec_ = nullptr;
+
+  // ---- record-once token replay (params SSBO + persistent segments) ----
+  ink::vk::Buffer params_;                 // host-coherent GpuParamsRow[49]
+  void* prm_ = nullptr;                    // mapped rows (stride below)
+  VkDeviceSize prm_stride_ = 64;           // >=64, SBO-aligned
+  int slot_full_[48] = {};                 // cache slot -> is_full_attn(layer)
+  uint32_t pstride_ = 0;                   // fixed probs row stride (cap_+8)
+  uint32_t score_gy_ = 0;                  // fixed attn_scores grid.y
+  std::vector<std::unique_ptr<ink::vk::Recorder>> segs_;   // persistent cbs
+  std::vector<std::unique_ptr<ink::vk::Recorder>> trec13_, trec2_;
+  std::vector<int> staged_layer_;  // segment boundary k -> staged visit's layer
+  std::vector<int> staged_vidx_;   // boundary k -> visit index (sentinel slot)
+  // Two-phase staging: w13 copies feed their own segment while the w2
+  // copies keep streaming on the SDMA queue (needs a dedicated transfer
+  // queue + timeline semaphore; otherwise single-phase as before).
+  bool split_stg_ = false;
+  VkFence seg_fence_ = VK_NULL_HANDLE;     // ids/logits readback fence (reused)
+  VkSemaphore tl_sem_ = VK_NULL_HANDLE;    // transfer->compute ordering
+  uint64_t tl_val_ = 0;                    // last value signaled on tl_sem_
+  bool tl_en_ = false;                     // timeline semaphores available
+  uint64_t rec_disp_ = 0, rec_cp_ = 0, rec_bar_ = 0;  // per-token stat deltas
 
   // ---- INK_GPU_TS=1: GPU timestamps inside the recorded token cb ----
   // One timestamp at cb start plus one after every op/mv/cp/fill. The op
@@ -236,6 +291,8 @@ class GpuGraph {
   int64_t rb_vis_ = 0;    // float offset of the visit-dump region
   int64_t rb_dbg_ = 0;    // float offset of the visit0 debug region
   int64_t rb_ids_ = 0;    // float offset of the 8-int32 router-id region
+  int64_t rb_sen_ = 0;    // float offset of the sentinel dwords (ids-ready
+                        // spin-poll marks; one per visit + one for fin)
 };
 
 }  // namespace ink::gpu

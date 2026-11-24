@@ -332,4 +332,107 @@ struct PcLogScaleSeq { uint32_t n, total, pos0; };
 /*   matvec_mxfp8_stage.comp: bindings 0-4 as matvec_mxfp8_mslot      */
 /*   moe_accum_stage.comp:    bindings 0-8 as moe_accum_mslot         */
 
+/* ================================================================== */
+/* PARAMS ROWS (GpuGraph record-once decode):                         */
+/*   Every token-varying scalar the decode kernels need rides in ONE  */
+/*   host-coherent storage block so the recorded command buffers are  */
+/*   fully token-invariant (recorded once at init, resubmitted per    */
+/*   token after a host memcpy). The block is an array of 64-byte     */
+/*   rows; each consumer binds ONE row slice as its LAST binding:     */
+/*     rows 0..47 = per-cache-slot values (offset slot*64),           */
+/*     row 48     = global header (token/pos/tau), offset 48*64.      */
+/*   The descriptor slice is 64 bytes; the GLSL struct below is the   */
+/*   exact appended declaration inside each consumer shader:          */
+/*     layout(set=0,binding=B,std430) readonly buffer PrmBuf {        */
+/*       uint prm_token; float prm_tau; uint prm_pos;                 */
+/*       uint prm_kv_len; uint prm_j0; uint prm_n; uint prm_filled[4];*/
+/*     } prm;                                                         */
+/*   Fields a shader does not need are simply unread. The push-const  */
+/*   blocks above are UNCHANGED; fields now sourced from params are   */
+/*   dead and pushed as record-time values only:                      */
+/*     embed_norm:  pc.token   -> prm_token    (header row)           */
+/*     log_scale:   pc.tau     -> prm_tau      (header row)           */
+/*     attn_scores: pc.j0/n/pos-> prm_j0/n/pos (slot row)             */
+/*     attn_softmax: pc.n      -> prm_n        (slot row)             */
+/*     attn_accum:  pc.j0/n    -> prm_j0/n     (slot row)             */
+/*     conv4_*:     pc.filled  -> prm_filled[pc.filled], so the PC    */
+/*                  field now carries the STREAM index (0 k,1 v,     */
+/*                  2 attn,3 mlp) for the slot row bound beside it.   */
+/*     kv_append:   new; replaces the two kv-bank vkCmdCopyBuffer     */
+/*                  appends (copy dst offsets can't be device-driven).*/
+/*                  b0 ro K[C] b1 ro V[C] b2 wo KVK b3 wo KVV (slot-  */
+/*                  sliced banks) b4 params; PC {uint C}; grid=ceil/64*/
+struct GpuParamsRow {
+  uint32_t token;    // embed row index (embed_norm; header row)
+  float    tau;      // log_scale multiplier (header row)
+  uint32_t pos;      // absolute position (attn_scores rel-bias index)
+  uint32_t kv_len;   // rows already in the slot's KV bank (pre-append)
+  uint32_t j0;       // attention window start (slot row)
+  uint32_t n;        // attention window length (slot row)
+  uint32_t filled[4];// conv4 per-stream filled counts (slot row)
+  uint32_t pad[6];   // -> 64 bytes, descriptor-offset aligned
+};
+constexpr uint32_t GPU_PARAMS_ROWS = 49;  // 48 slots + 1 header
+
+/* ================================================================== */
+/* DRAFT KERNELS (GpuDrafter — MTP/DFlare speculative head, 07 §9):    */
+/*   All draft weights bf16; activations f32 with bf16 rounding only    */
+/*   where the spec mandates (residual adds, markov intermediates).     */
+/*   Draft constants: H=2304, HQ=24, HK=8, DH=128, I=9216, BLOCK=8,    */
+/*   RNN rank 256, V=200058 (unpad), FWT row stride VSTR=200064.        */
+/*                                                                    */
+/* draft_mix.comp  grid.x = 4 (one wg per consumer: layers 0-2 + f_rnn)*/
+/*   ctx[c*H+i] = rmsnorm_w(sum_j ALPHA[c*4+j]*TAPS[j*H+i], GAM[c*H])   */
+/*   b0 ro f32 TAPS[4H]  b1 ro f32 ALPHA[16]  b2 ro f32 GAM[4H]         */
+/*   b3 wo f32 CTX[4H];  PC {uint n; float eps}                         */
+struct PcDraftMix { uint32_t n; float eps; };
+/*                                                                    */
+/* draft_rope.comp  grid.x = nheads_total (64 lanes, pairs d/d+64)      */
+/*   head g covers slot g/pc.per_row at position pc.pos0+slot; neox     */
+/*   half-split rotate, inv_freq[i] = theta^(-i/64).                   */
+/*   b0 rw f32 X[nheads*128];  PC {uint per_row; uint pos0; float theta}*/
+struct PcDraftRope { uint32_t per_row, pos0; float theta; };
+/*                                                                    */
+/* draft_attn.comp  grid = (HQ, 8). Non-causal block attention over     */
+/*   [ctx keys (n_ctx, positional window) ++ 8 block keys]; GQA g=h/3,  */
+/*   scale 128^-0.5, fp32 softmax, no sink. window=0 -> all ctx keys    */
+/*   visible; else ctx key visible iff qpos-kpos < window.             */
+/*   b0 ro Q[8*HQ*128]  b1 ro KCTX[cap*1024]  b2 ro VCTX                */
+/*   b3 ro KBLK[8*1024]  b4 ro VBLK  b5 ro u32 CTXPOS[cap]              */
+/*   b6 wo OUT[8*HQ*128];  shared score array sized MAXK=4232           */
+struct PcDraftAttn {
+  uint32_t n_ctx;   /* ctx rows visible (incl. the just-appended row)   */
+  uint32_t pos0;    /* absolute position of block slot 0 (the anchor)   */
+  uint32_t window;  /* 0 = full; else positional window (local layers)  */
+  float    scale;
+};
+constexpr uint32_t DRAFT_ATTN_MAXK = 4232;  /* shared s[] cap          */
+/*                                                                    */
+/* draft_swiglu.comp  grid.x = ceil(n/64): a[i] = silu(g[i])*u[i]       */
+/* draft_resid.comp   grid.x = ceil(n/64): out[i] = bf16(a[i]+b[i])     */
+/*   b0 ro G|A  b1 ro U|B  b2 wo OUT;  PC {uint n}                      */
+/*                                                                    */
+/* draft_pack.comp  grid.x = 80 (5120 lanes): builds the GRU input      */
+/*   IN = [bf16(STATE) | w1[did[slot*16]] | bf16(HID[slot]) |           */
+/*        bf16(CTX[3])]  = [256 | 256 | 2304 | 2304]                    */
+/*   b0 ro STATE[256]  b1 ro u32 W1[Vp*128] bf16-packed  b2 ro HID[8H]  */
+/*   b3 ro CTX[4H]  b4 ro u32 DID[] (16-stride cells)  b5 wo IN[5120]   */
+/*   PC {uint slot}                                                     */
+struct PcDraftPack { uint32_t slot; };
+/*                                                                    */
+/* draft_gru.comp  grid.x = 4 (256 lanes): one markov GRU step          */
+/*   g8=bf16(proj[i]+bias[i]) c8=bf16(proj[256+i]+...) o8=bf16(...+512) */
+/*   gate=bf16(sig(g8)) cand=bf16(tanh(c8)) lat=bf16(tanh(o8))          */
+/*   state[i]=bf16(gate*state[i]+(1-gate)*cand); LAT[i]=lat             */
+/*   b0 ro PROJ[768]  b1 ro BIAS[768]  b2 rw STATE[256]  b3 wo LAT[256] */
+/*                                                                    */
+/* draft_logits.comp  grid.x = ceil(V/64): folded markov logits         */
+/*   dvec = hidden_out @ LAT + hidden_out.bias (built upstream, K=256)  */
+/*   fold[v] = unembed[v,:] . dvec (bf16-packed dot, matvec_bf16 form)  */
+/*   s = bf16(bf16(BASE[slot*VSTR+v]) + fold); OUT[v] = 30*tanh(s/30)   */
+/*   b0 ro BASE[8*VSTR]  b1 ro u32 UNEMB[V*1152]  b2 ro DVEC[2304]      */
+/*   b3 wo OUT[V];  PC {uint slot}                                      */
+struct PcDraftLogits { uint32_t slot; };
+constexpr uint32_t DRAFT_VSTR = 200064;  /* padded V row stride (64B)  */
+
 }  // namespace ink::shaders

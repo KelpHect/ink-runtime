@@ -17,9 +17,14 @@ layout(local_size_x = 64) in;
 
 layout(set = 0, binding = 0, std430) buffer PBuf            { float p[]; };
 layout(set = 0, binding = 1, std430) readonly buffer SKBuf  { float sink[]; }; // [HQ]
+// record-once decode: this visit's slot params row carries the window length
+layout(set = 0, binding = 2, std430) readonly buffer PrmBuf {
+    uint prm_token; float prm_tau; uint prm_pos; uint prm_kv_len;
+    uint prm_j0; uint prm_n; uint prm_filled[4];
+} prm;
 
 layout(push_constant) uniform Pc {
-    uint n;        // window length = len - j0
+    uint n;        // dead under record-once decode (prm_n is read)
     uint pstride;
 } pc;
 
@@ -30,10 +35,11 @@ void main() {
     const uint tid = gl_LocalInvocationID.x;
     const uint base = h * pc.pstride;
     const float sk = sink[h];
+    const uint n   = prm.prm_n;
 
     // max over window AND the sink
     float mx = sk;
-    for (uint j = tid; j < pc.n; j += 64u) mx = max(mx, p[base + j]);
+    for (uint j = tid; j < n; j += 64u) mx = max(mx, p[base + j]);
     red[tid] = mx; barrier();
     for (uint s = 32u; s > 0u; s >>= 1) {
         if (tid < s) red[tid] = max(red[tid], red[tid + s]);
@@ -44,7 +50,7 @@ void main() {
 
     // sum of exp over window + sink
     float es = 0.0;
-    for (uint j = tid; j < pc.n; j += 64u) es += exp(p[base + j] - m);
+    for (uint j = tid; j < n; j += 64u) es += exp(p[base + j] - m);
     red[tid] = es; barrier();
     for (uint s = 32u; s > 0u; s >>= 1) {
         if (tid < s) red[tid] += red[tid + s];
@@ -53,6 +59,6 @@ void main() {
     const float z = red[0] + exp(sk - m);
 
     // normalize in place; sink prob appended at index n
-    for (uint j = tid; j < pc.n; j += 64u) p[base + j] = exp(p[base + j] - m) / z;
-    if (tid == 0u) p[base + pc.n] = exp(sk - m) / z;
+    for (uint j = tid; j < n; j += 64u) p[base + j] = exp(p[base + j] - m) / z;
+    if (tid == 0u) p[base + n] = exp(sk - m) / z;
 }

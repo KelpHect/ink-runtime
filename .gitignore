@@ -39,3 +39,5 @@ _build*.bat
 testdata/ink_*/
 testdata/ink_vk/
 testdata/*.log
+build3/
+/*.bin

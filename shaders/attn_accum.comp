@@ -18,13 +18,18 @@ layout(local_size_x = 64) in;
 layout(set = 0, binding = 0, std430) readonly buffer PBuf  { float p[]; };  // [HQ*pstride]
 layout(set = 0, binding = 1, std430) readonly buffer VBuf  { float v[]; };  // [len*HK*DH]
 layout(set = 0, binding = 2, std430) writeonly buffer OBuf { float o[]; };  // [HQ*DH]
+// record-once decode: this visit's slot params row carries j0/n
+layout(set = 0, binding = 3, std430) readonly buffer PrmBuf {
+    uint prm_token; float prm_tau; uint prm_pos; uint prm_kv_len;
+    uint prm_j0; uint prm_n; uint prm_filled[4];
+} prm;
 
 layout(push_constant) uniform Pc {
     uint hq;
     uint hk;
     uint dh;
-    uint j0;
-    uint n;        // window length = len - j0
+    uint j0;       // dead under record-once decode (prm_j0 is read)
+    uint n;        // dead (prm_n)
     uint pstride;
 } pc;
 
@@ -36,8 +41,8 @@ void main() {
 
     for (uint d = tid; d < pc.dh; d += 64u) {
         float acc = 0.0;
-        for (uint jj = 0u; jj < pc.n; jj++)
-            acc += p[pb + jj] * v[(pc.j0 + jj) * (pc.hk * pc.dh) + g * pc.dh + d];
+        for (uint jj = 0u; jj < prm.prm_n; jj++)
+            acc += p[pb + jj] * v[(prm.prm_j0 + jj) * (pc.hk * pc.dh) + g * pc.dh + d];
         o[h * pc.dh + d] = acc;
     }
 }

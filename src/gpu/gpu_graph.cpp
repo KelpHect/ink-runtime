@@ -282,6 +282,16 @@ void GpuGraph::fill(const ink::vk::Buffer& d, VkDeviceSize off, VkDeviceSize sz,
   ts_mark("fill", tag);
 }
 
+// cpr: one vkCmdCopyBuffer carrying a whole region array — the driver
+// emits a single SDMA packet set instead of one per slice.
+void GpuGraph::cpr(const ink::vk::Buffer& s, const ink::vk::Buffer& d,
+                   const VkBufferCopy* regs, uint32_t n, const char* tag) {
+  if (building_) return;
+  rec_->copy_buffer_regions(s.buf, d.buf, regs, n);
+  stats.copies += n;
+  ts_mark("copy", tag);
+}
+
 // ---- INK_GPU_TS: timestamp boundary after each recorded op ----
 
 // op-class for the grouped totals. The nvfp4/mxfp8 slot matvecs are expert
@@ -533,23 +543,27 @@ void GpuGraph::emit_visit_a(int i, int p, int64_t pos) {
     mv(*L.vconv_wp.p, BW(*L.vconv_wp.b), BA(inbuf_, xo[2], H), BW(tv_), 32, H,
        "vconp");
     sync();
-    sh::PcConv4Dyn pk{uint32_t(Ckv), 128u, uint32_t(conv_filled_[slot][0]),
-                      sh::F_UPDATE};
-    op(p_cvd_, {BW(k_), BW(*L.kconv_sw), BW(tk_), histb(slot, 0, Ckv), BW(k_)},
+    // pc.filled carries the STREAM index now; the count lives in this
+    // slot's params row (prm_filled[stream]).
+    sh::PcConv4Dyn pk{uint32_t(Ckv), 128u, 0u, sh::F_UPDATE};
+    op(p_cvd_,
+       {BW(k_), BW(*L.kconv_sw), BW(tk_), histb(slot, 0, Ckv), BW(k_),
+        prm_b(slot)},
        &pk, sizeof(pk), wg64(Ckv), 1, "kconv");
-    sh::PcConv4Dyn pv{uint32_t(Ckv), 128u, uint32_t(conv_filled_[slot][1]),
-                      sh::F_UPDATE};
-    op(p_cvd_, {BW(v_), BW(*L.vconv_sw), BW(tv_), histb(slot, 1, Ckv), BW(v_)},
+    sh::PcConv4Dyn pv{uint32_t(Ckv), 128u, 1u, sh::F_UPDATE};
+    op(p_cvd_,
+       {BW(v_), BW(*L.vconv_sw), BW(tv_), histb(slot, 1, Ckv), BW(v_),
+        prm_b(slot)},
        &pv, sizeof(pv), wg64(Ckv), 1, "vconv");
   } else {
-    sh::PcConv4Static pk{uint32_t(Ckv), uint32_t(conv_filled_[slot][0]),
-                         sh::F_UPDATE};
-    op(p_cvs_, {BW(k_), BW(*L.kconv_w), histb(slot, 0, Ckv), BW(k_)}, &pk,
-       sizeof(pk), wg64(Ckv), 1, "kconv");
-    sh::PcConv4Static pv{uint32_t(Ckv), uint32_t(conv_filled_[slot][1]),
-                         sh::F_UPDATE};
-    op(p_cvs_, {BW(v_), BW(*L.vconv_w), histb(slot, 1, Ckv), BW(v_)}, &pv,
-       sizeof(pv), wg64(Ckv), 1, "vconv");
+    sh::PcConv4Static pk{uint32_t(Ckv), 0u, sh::F_UPDATE};
+    op(p_cvs_, {BW(k_), BW(*L.kconv_w), histb(slot, 0, Ckv), BW(k_),
+                prm_b(slot)},
+       &pk, sizeof(pk), wg64(Ckv), 1, "kconv");
+    sh::PcConv4Static pv{uint32_t(Ckv), 1u, sh::F_UPDATE};
+    op(p_cvs_, {BW(v_), BW(*L.vconv_w), histb(slot, 1, Ckv), BW(v_),
+                prm_b(slot)},
+       &pv, sizeof(pv), wg64(Ckv), 1, "vconv");
   }
   sync();
 
@@ -569,21 +583,27 @@ void GpuGraph::emit_visit_a(int i, int p, int64_t pos) {
     const double tau =
         1.0 + c.log_scaling_alpha *
                   std::log(std::max(double(pos + 1) / c.log_scaling_n_floor, 1.0));
+    // pc.tau is dead under record-once decode: the shader reads prm_tau
+    // from the params header row (write_params keeps it current).
     PcTau pq{3072u, float(tau)};
-    op(p_log_, {BW(q_)}, &pq, sizeof(pq), wg64(3072), 1, "log_q");
+    op(p_log_, {BW(q_), prm_head()}, &pq, sizeof(pq), wg64(3072), 1, "log_q");
     PcTau pr{384u, float(tau)};
-    op(p_log_, {BW(r_)}, &pr, sizeof(pr), wg64(384), 1, "log_r");
+    op(p_log_, {BW(r_), prm_head()}, &pr, sizeof(pr), wg64(384), 1, "log_r");
     sync();
   }
 
+  // len/j0/n still feed the (now-dead) PC fields; the shaders read the
+  // slot's params row instead — and the kv-append is a dispatch, not a
+  // recorded copy, because the bank dst offset varies per token.
   const int64_t len = kv_len_[slot] + 1;
   const int64_t j0 =
       L.full ? 0 : std::max<int64_t>(0, len - c.sliding_window_size);
-  const uint32_t n = uint32_t(len - j0), pstr = n + 1;
-  cp(k_, 0, kvk_, kvb(kvk_, slot).off + VkDeviceSize(kv_len_[slot]) * 4096,
-     4096, "kv_k");
-  cp(v_, 0, kvv_, kvb(kvv_, slot).off + VkDeviceSize(kv_len_[slot]) * 4096,
-     4096, "kv_v");
+  const uint32_t n = uint32_t(len - j0);
+  {
+    PcN kva{uint32_t(Ckv)};
+    op(p_kva_, {BW(k_), BW(v_), kvb(kvk_, slot), kvb(kvv_, slot), prm_b(slot)},
+       &kva, sizeof(kva), wg64(Ckv), 1, "kv_app");
+  }
   {
     sh::PcRelBias pc{16u, 1024u, 24u * 1024u};
     op(p_rel_, {BW(r_), BW(*L.relproj), BW(rel_)}, &pc, sizeof(pc),
@@ -595,21 +615,24 @@ void GpuGraph::emit_visit_a(int i, int p, int64_t pos) {
   sync();
 
   {
+    // j0/n/pos are dead PC fields (slot params row supplies them); pstride
+    // and the grid are fixed so the dispatch is identical every token.
     sh::PcAttnScores pc{24u, 8u, 128u, uint32_t(j0), n, uint32_t(pos), 1024u,
-                        pstr};
-    op(p_sco_, {BW(q_), kvb(kvk_, slot), BW(rel_), BW(probs_)}, &pc,
-       sizeof(pc), 24, (n + 63) / 64, "scores");
+                        pstride_};
+    op(p_sco_, {BW(q_), kvb(kvk_, slot), BW(rel_), BW(probs_), prm_b(slot)},
+       &pc, sizeof(pc), 24, score_gy_, "scores");
   }
   sync();
   {
-    sh::PcAttnSoftmax pc{n, pstr};
-    op(p_smx_, {BW(probs_), BW(sink_)}, &pc, sizeof(pc), 24, 1, "softmax");
+    sh::PcAttnSoftmax pc{n, pstride_};
+    op(p_smx_, {BW(probs_), BW(sink_), prm_b(slot)}, &pc, sizeof(pc), 24, 1,
+       "softmax");
   }
   sync();
   {
-    sh::PcAttnAccum pc{24u, 8u, 128u, uint32_t(j0), n, pstr};
-    op(p_acc_, {BW(probs_), kvb(kvv_, slot), BW(o_)}, &pc, sizeof(pc), 24, 1,
-       "accum");
+    sh::PcAttnAccum pc{24u, 8u, 128u, uint32_t(j0), n, pstride_};
+    op(p_acc_, {BW(probs_), kvb(kvv_, slot), BW(o_), prm_b(slot)}, &pc,
+       sizeof(pc), 24, 1, "accum");
   }
   sync();
   {
@@ -629,9 +652,10 @@ void GpuGraph::emit_visit_a(int i, int p, int64_t pos) {
   sync();
   dbg_cp(attn_out_, 7);
   {
-    sh::PcConv4Static pc{uint32_t(H), uint32_t(conv_filled_[slot][2]),
-                         sh::F_UPDATE};
-    op(p_cvs_, {BW(attn_out_), BW(*L.attn_sconv), histb(slot, 2, H), BW(a_out_)},
+    sh::PcConv4Static pc{uint32_t(H), 2u, sh::F_UPDATE};  // stream 2 = attn
+    op(p_cvs_,
+       {BW(attn_out_), BW(*L.attn_sconv), histb(slot, 2, H), BW(a_out_),
+        prm_b(slot)},
        &pc, sizeof(pc), wg64(H), 1, "attn_conv");
   }
   sync();
@@ -688,6 +712,12 @@ void GpuGraph::emit_visit_a(int i, int p, int64_t pos) {
   // host handoff for expert staging: the router's top-k ids are read back
   // after this submit's fence and program the next submit's slice copies.
   cp(ridx_, 0, readback_, VkDeviceSize(rb_ids_) * 4, 32, "ids");
+  // Staged visits end their segment here: this fill is the LAST command,
+  // so a host spin on the sentinel sees the ids one memory-write earlier
+  // than the cb's fence would fire (fence + tail + wake ~0.2ms).
+  if (!L.experts_dev && stage_ok_)
+    fill(readback_, VkDeviceSize(rb_sen_ + vidx) * 4, 4,
+         uint32_t(vidx + 1), "sen");
   if (dbg && !building_) {
     cp(ridx_, 0, readback_, (rb_dbg_ + int64_t(13) * H) * 4, 32);
     cp(rw_, 0, readback_, (rb_dbg_ + int64_t(13) * H) * 4 + 32, 32);
@@ -703,7 +733,14 @@ void GpuGraph::emit_visit_a(int i, int p, int64_t pos) {
 // host-side counters. In the record walk it is emitted at the head of the
 // submit AFTER emit_visit_a(i,p)'s, so ridx_/rw_ still hold this visit's
 // router output and stage_ids_ carries its freshly read top-k ids.
-void GpuGraph::emit_visit_b(int i, int p) {
+//
+// part: 0 = whole tail; 1 = only the w13 phase (moe_zero + gate/up GEMVs,
+// which need the w13 slices); 2 = the w2 phase onward (accum, reduce, mlp
+// conv, out_add, dump, counters). The two-phase staging path records
+// part 1 into its own segment so the w2 slice copies can stream on the
+// SDMA queue WHILE the w13 GEMVs run — previously the copies hid under
+// ~35ms of host record; record-once left them fully exposed.
+void GpuGraph::emit_visit_b(int i, int p, int part) {
   const ModelConfig& c = *cfg_;
   const int H = H_;
   const int64_t Hb = int64_t(H) * 4;
@@ -736,35 +773,39 @@ void GpuGraph::emit_visit_b(int i, int p) {
   // then one moe_reduce summing the rows into moe_out_. The 8 expert weight
   // streams overlap on the link instead of serializing behind per-slot
   // barriers — w2 bytes are ~1/3 of the per-token PCIe traffic.
-  fill(moe_rows_, 0, 8 * Hb, 0u, "moe_zero");
-  const Pipe& p13 =
-      L.mxfp8 ? (stage ? p_mx8st_ : p_mx8m_) : (stage ? p_nv4st_ : p_nv4m_);
-  const Bnd w13b = stage ? BW(stg_w13w_) : BW(*L.w13);
-  const Bnd w13sb = stage ? BW(stg_w13s_) : BW(*L.w13s);
-  const Bnd w2b = stage ? BW(stg_w2w_) : BW(*L.w2);
-  const Bnd w2sb = stage ? BW(stg_w2s_) : BW(*L.w2s);
-  const Pipe& pac = stage ? p_moest_ : p_moem_;
-  // All 8 expert slots in ONE dispatch per weight (slot = gl_WorkGroupID.y):
-  // per-dispatch fixed cost, not bandwidth, dominated the per-slot version.
-  if (L.mxfp8) {
-    sh::PcMxfp8 pg{0u, uint32_t(L.w13R), uint32_t(H), 0u, 2u, 1.f, 0u};
-    op(p13, {w13b, w13sb, BW(mn_), BW(gate_), BW(ridx_)}, &pg, sizeof(pg),
-       uint32_t(I), 8, "w13");
-    sh::PcMxfp8 pu{0u, uint32_t(L.w13R), uint32_t(H), 1u, 2u, 1.f, 0u};
-    op(p13, {w13b, w13sb, BW(mn_), BW(up_), BW(ridx_)}, &pu, sizeof(pu),
-       uint32_t(I), 8, "w13");
-  } else {
-    sh::PcNvfp4 pg{0u, uint32_t(L.w13R), uint32_t(H), 0u, 2u, 1.f, 0u};
-    op(p13, {w13b, w13sb, BW(*L.w13a), BW(*L.w13o), BW(mn_), BW(gate_),
-             BW(ridx_)},
-       &pg, sizeof(pg), uint32_t(I), 8, "w13");
-    sh::PcNvfp4 pu{0u, uint32_t(L.w13R), uint32_t(H), 1u, 2u, 1.f, 0u};
-    op(p13, {w13b, w13sb, BW(*L.w13a), BW(*L.w13o), BW(mn_), BW(up_),
-             BW(ridx_)},
-       &pu, sizeof(pu), uint32_t(I), 8, "w13");
+  if (part != 2) {
+    fill(moe_rows_, 0, 8 * Hb, 0u, "moe_zero");
+    const Pipe& p13 =
+        L.mxfp8 ? (stage ? p_mx8st_ : p_mx8m_) : (stage ? p_nv4st_ : p_nv4m_);
+    const Bnd w13b = stage ? BW(stg_w13w_) : BW(*L.w13);
+    const Bnd w13sb = stage ? BW(stg_w13s_) : BW(*L.w13s);
+    // All 8 expert slots in ONE dispatch per weight (slot =
+    // gl_WorkGroupID.y): per-dispatch fixed cost, not bandwidth, dominated
+    // the per-slot version.
+    if (L.mxfp8) {
+      sh::PcMxfp8 pg{0u, uint32_t(L.w13R), uint32_t(H), 0u, 2u, 1.f, 0u};
+      op(p13, {w13b, w13sb, BW(mn_), BW(gate_), BW(ridx_)}, &pg, sizeof(pg),
+         uint32_t(I), 8, "w13");
+      sh::PcMxfp8 pu{0u, uint32_t(L.w13R), uint32_t(H), 1u, 2u, 1.f, 0u};
+      op(p13, {w13b, w13sb, BW(mn_), BW(up_), BW(ridx_)}, &pu, sizeof(pu),
+         uint32_t(I), 8, "w13");
+    } else {
+      sh::PcNvfp4 pg{0u, uint32_t(L.w13R), uint32_t(H), 0u, 2u, 1.f, 0u};
+      op(p13, {w13b, w13sb, BW(*L.w13a), BW(*L.w13o), BW(mn_), BW(gate_),
+               BW(ridx_)},
+         &pg, sizeof(pg), uint32_t(I), 8, "w13");
+      sh::PcNvfp4 pu{0u, uint32_t(L.w13R), uint32_t(H), 1u, 2u, 1.f, 0u};
+      op(p13, {w13b, w13sb, BW(*L.w13a), BW(*L.w13o), BW(mn_), BW(up_),
+               BW(ridx_)},
+         &pu, sizeof(pu), uint32_t(I), 8, "w13");
+    }
+    sync();
   }
-  sync();
+  if (part == 1) return;  // w2 phase waits its own transfer submit
   {
+    const Bnd w2b = stage ? BW(stg_w2w_) : BW(*L.w2);
+    const Bnd w2sb = stage ? BW(stg_w2s_) : BW(*L.w2s);
+    const Pipe& pac = stage ? p_moest_ : p_moem_;
     sh::PcMoeAccum pc{0u, uint32_t(L.w2R), uint32_t(I), L.mxfp8 ? 1u : 0u,
                       float(c.mlp_gate_softcap), float(c.mlp_up_softcap), 0.f};
     op(pac,
@@ -781,9 +822,10 @@ void GpuGraph::emit_visit_b(int i, int p) {
   sync();
   dbg_cp(moe_out_, 11);
   {
-    sh::PcConv4Static pc{uint32_t(H), uint32_t(conv_filled_[slot][3]),
-                         sh::F_UPDATE};
-    op(p_cvs_, {BW(moe_out_), BW(*L.mlp_sconv), histb(slot, 3, H), BW(mo_)},
+    sh::PcConv4Static pc{uint32_t(H), 3u, sh::F_UPDATE};  // stream 3 = mlp
+    op(p_cvs_,
+       {BW(moe_out_), BW(*L.mlp_sconv), histb(slot, 3, H), BW(mo_),
+        prm_b(slot)},
        &pc, sizeof(pc), wg64(H), 1, "mlp_conv");
   }
   sync();
@@ -813,9 +855,11 @@ void GpuGraph::emit_head(int token, int64_t pos) {
   cur_scope_ = "pre";  // INK_GPU_TS: non-visit sections get an explicit scope
   cur_phase_ = 0;
   {
+    // pc.token is dead under record-once decode: the shader reads
+    // prm_token out of the params header row (rewritten per token).
     PcEmb pc{uint32_t(token), uint32_t(H), float(c.rms_norm_eps), emb_flags_};
-    op(p_emb_, {BW(embedw_), BW(embn_), BW(partial_)}, &pc, sizeof(pc), 1, 1,
-       "embed");
+    op(p_emb_, {BW(embedw_), BW(embn_), BW(partial_), prm_head()}, &pc,
+       sizeof(pc), 1, 1, "embed");
   }
   sync();
 }
@@ -875,35 +919,45 @@ void GpuGraph::emit_fin() {
   }
   sync();
   cp(logits_, 0, readback_, 0, VkDeviceSize(V_) * 4, "logits");
+  // slot 48 = the logits-ready sentinel (last command of the token cb)
+  fill(readback_, VkDeviceSize(rb_sen_ + 48) * 4, 4, 49u, "sen");
 }
 
 // ------------------------------------------------------- expert-slice stage
 
 // 32 vkCmdCopyBuffer slices (4 tensors x 8 top-k slots) for one
 // host-resident layer: expert ids[s] -> slot s of each stg_*_ buffer.
-// Recorded into a transfer-queue cb submitted right after the visit's
-// compute cb fences — stage_ids_ was just written by that visit's
-// router-id readback. Slice/offset math is in BYTES (vkCmdCopyBuffer),
-// unlike BA() which takes float element counts.
-void GpuGraph::stage_copies(const Lw& L) {
+// The 8 slot regions of each tensor go in ONE vkCmdCopyBuffer call —
+// fewer driver packets for the same bytes. Recorded into a transfer-queue
+// cb submitted right after the visit's compute cb fences — stage_ids_ was
+// just written by that visit's router-id readback. Slice/offset math is
+// in BYTES (vkCmdCopyBuffer), unlike BA() which takes float elements.
+// part: 0 = all four tensors (single-phase), 1 = w13 pair, 2 = w2 pair.
+void GpuGraph::stage_copies(const Lw& L, int part) {
   const int64_t E = cfg_->n_routed_experts;
-  for (int s = 0; s < 8; s++) {
-    int64_t e = stage_ids_[s];
-    if (e < 0 || e >= E) e = 0;  // clamp: a bad id must never index OOB
-    const VkDeviceSize eo = VkDeviceSize(e);
-    const VkDeviceSize so = VkDeviceSize(s);
-    if (L.sl13w > 0)
-      cp(*L.w13, eo * VkDeviceSize(L.sl13w), stg_w13w_,
-         so * VkDeviceSize(L.sl13w), VkDeviceSize(L.sl13w), "stg13w");
-    if (L.sl13s > 0)
-      cp(*L.w13s, eo * VkDeviceSize(L.sl13s), stg_w13s_,
-         so * VkDeviceSize(L.sl13s), VkDeviceSize(L.sl13s), "stg13s");
-    if (L.sl2w > 0)
-      cp(*L.w2, eo * VkDeviceSize(L.sl2w), stg_w2w_,
-         so * VkDeviceSize(L.sl2w), VkDeviceSize(L.sl2w), "stg2w");
-    if (L.sl2s > 0)
-      cp(*L.w2s, eo * VkDeviceSize(L.sl2s), stg_w2s_,
-         so * VkDeviceSize(L.sl2s), VkDeviceSize(L.sl2s), "stg2s");
+  const struct Tn {
+    const vk::Buffer* s;
+    const vk::Buffer* d;
+    int64_t sl;
+    int want;
+    const char* tag;
+  } T[4] = {
+      {L.w13, &stg_w13w_, L.sl13w, 1, "stg13w"},
+      {L.w13s, &stg_w13s_, L.sl13s, 1, "stg13s"},
+      {L.w2, &stg_w2w_, L.sl2w, 2, "stg2w"},
+      {L.w2s, &stg_w2s_, L.sl2s, 2, "stg2s"},
+  };
+  VkBufferCopy regs[8];
+  for (const Tn& t : T) {
+    if (t.sl <= 0 || (part != 0 && t.want != part)) continue;
+    for (int s = 0; s < 8; s++) {
+      int64_t e = stage_ids_[s];
+      if (e < 0 || e >= E) e = 0;  // clamp: a bad id must never index OOB
+      regs[s] = {VkDeviceSize(e) * VkDeviceSize(t.sl),
+                 VkDeviceSize(s) * VkDeviceSize(t.sl),
+                 VkDeviceSize(t.sl)};
+    }
+    cpr(*t.s, *t.d, regs, 8, t.tag);
   }
 }
 
@@ -944,130 +998,264 @@ const float* GpuGraph::visit_dump(int vidx, int phase) const {
 }
 const float* GpuGraph::dbg(int row) const { return rb_ + rb_dbg_ + int64_t(row) * H_; }
 
-const std::vector<float>& GpuGraph::forward_token(int token, int64_t pos) {
-  const ModelConfig& c = *cfg_;
-  site_cursor_ = 0;
+// ------------------------------------------------- record-once segments
+// record_segments: the RECORD walker — same flat op() sequence as the
+// build walk, but each compute command buffer is a persistent Recorder in
+// segs_ that forward_token resubmits every token. A segment boundary sits
+// between a staged visit's a() (which ends with the 32B router-id readback
+// copy) and its b(): staged_layer_[k] names the visit whose ids the fence
+// after segs_[k] makes host-visible. The ~32 slice copies per boundary are
+// the ONLY commands still recorded per token (they carry the freshly read
+// expert ids in their source offsets); everything else is baked.
+bool GpuGraph::record_segments() {
   building_ = false;
-  // Compute cbs hold a(v) then b(v) per visit in the same flat order the
-  // build walk produces; a cb is closed only before a STAGED visit's b():
-  // a(v) ends with the 32B router-id readback, so after that cb's fence
-  // the host programs visit v's 32 slice copies on the transfer queue —
-  // the SDMA pull then overlaps the next compute cb's host record, and
-  // the trec fence wait before its submit orders the copies ahead of the
-  // stage GEMVs. Dev-resident visits cost no split at all (their GEMVs
-  // read ridx_ on-device in-order, as they always did).
-  vk::Recorder rec, trec;
-  bool rec_open = false, tpend = false, ts_head = false;
+  site_cursor_ = 0;
+  const ModelConfig& c = *cfg_;
+  auto open_seg = [&]() -> ink::vk::Recorder* {
+    auto r = std::make_unique<ink::vk::Recorder>();
+    if (!r->begin(cpool_)) {
+      err_ = "segment recorder begin failed: " + r->error();
+      return nullptr;
+    }
+    rec_ = r.get();
+    segs_.push_back(std::move(r));
+    return rec_;
+  };
+  if (!open_seg()) return false;
+  if (ts_en_) {
+    // slot 0 = cb0 start; slots 1.. = one mark after each recorded op.
+    rec_->reset_query_pool(ts_pool_, 0, ts_cap_);
+    rec_->write_timestamp(ts_pool_, 0);
+    ts_next_ = 1;
+  }
+  emit_head(0, 0);
+  for (int s = 0; s < 48; s++) {
+    if (s == 6)
+      emit_snap();
+    else if (s == 18)
+      emit_bank(1);
+    else if (s == 30)
+      emit_bank(2);
+    int i, p;
+    visit_ip(c, s, i, p);
+    emit_visit_a(i, p, 0);
+    if (!lw_[i].experts_dev && stage_ok_) {
+      // Staged visit: close the segment right after a(v)'s router-id copy;
+      // the next segment opens with b(v) and waits (device-side, via the
+      // timeline semaphore) on this visit's slice copies.
+      if (!rec_->end()) {
+        err_ = "segment end failed";
+        return false;
+      }
+      rec_ = nullptr;
+      staged_layer_.push_back(i);
+      staged_vidx_.push_back(c.visit_index(i, p));
+      if (!open_seg()) return false;
+      ts_gap();  // cb-start mark; segment = the inter-submit gap
+      if (split_stg_) {
+        // Two-phase staging: b(v) splits at moe_accum — the w13 phase is
+        // its own (unfenced) segment gated on the w13 transfer submit;
+        // the w2 copies stream on the SDMA queue while it runs.
+        emit_visit_b(i, p, 1);
+        if (!rec_->end()) {
+          err_ = "w13 segment end failed";
+          return false;
+        }
+        rec_ = nullptr;
+        if (!open_seg()) return false;
+        ts_gap();
+        emit_visit_b(i, p, 2);
+      } else {
+        emit_visit_b(i, p, 0);
+      }
+    } else {
+      emit_visit_b(i, p, 0);
+    }
+  }
+  emit_fin();
+  if (!rec_->end()) {
+    err_ = "final segment end failed";
+    return false;
+  }
+  rec_ = nullptr;
+  const size_t nst = staged_layer_.size();
+  trec13_.resize(nst);
+  trec2_.resize(nst);
+  for (auto& t : trec13_) t = std::make_unique<ink::vk::Recorder>();
+  for (auto& t : trec2_) t = std::make_unique<ink::vk::Recorder>();
+  // per-token counter/stat deltas: the emit helpers already counted the
+  // recorded ops once; replay adds them to stats per forward_token.
+  rec_disp_ = stats.dispatches;
+  rec_cp_ = stats.copies;
+  rec_bar_ = stats.barriers;
+  return err_.empty();
+}
+
+// write_params: the ONLY per-token data the baked command buffers need —
+// one memcpy of the 49 params rows, then the host-side counters advance
+// exactly as emit_visit_b's bookkeeping did per visit.
+void GpuGraph::write_params(int token, int64_t pos) {
+  const ModelConfig& c = *cfg_;
+  // Sentinels back to zero: the recorded fills re-arm them as each
+  // boundary's last command executes (cleared while idle — tokens are
+  // serial, so the previous cb is done before this runs).
+  std::memset(rb_ + rb_sen_, 0, 64 * 4);
+  const double tau =
+      1.0 + c.log_scaling_alpha *
+                std::log(
+                    std::max(double(pos + 1) / c.log_scaling_n_floor, 1.0));
+  sh::GpuParamsRow& hdr = *prm_row(48);
+  hdr.token = uint32_t(token);
+  hdr.pos = uint32_t(pos);
+  hdr.tau = float(tau);
+  for (int s = 0; s < 48; s++) {
+    sh::GpuParamsRow& r = *prm_row(s);
+    const int64_t len = kv_len_[s] + 1;
+    const int64_t j0 = slot_full_[s]
+                           ? 0
+                           : std::max<int64_t>(
+                                 0, len - c.sliding_window_size);
+    r.kv_len = uint32_t(kv_len_[s]);
+    r.j0 = uint32_t(j0);
+    r.n = uint32_t(len - j0);
+    r.pos = uint32_t(pos);
+    for (int st = 0; st < 4; st++)
+      r.filled[st] = uint32_t(conv_filled_[s][st]);
+  }
+  alloc_->flush(params_);  // no-op on coherent memory
+  for (int s = 0; s < 48; s++) {
+    kv_len_[s]++;
+    for (int st = 0; st < 4; st++)
+      conv_filled_[s][st] = std::min(3, conv_filled_[s][st] + 1);
+  }
+}
+
+const std::vector<float>& GpuGraph::forward_token(int token, int64_t pos) {
   const auto t0 = clk::steady_clock::now();
   const double wait0 = stats.wait_ms;
   bool fail = false;
-  auto begin_cb = [&]() -> bool {
-    if (!rec.begin(cpool_)) {
-      err_ = "recorder begin failed: " + rec.error();
+  write_params(token, pos);
+  stats.dispatches += rec_disp_;
+  stats.copies += rec_cp_;
+  stats.barriers += rec_bar_;
+
+  // Replay: each fenced segment ends with staged visit k's router-id
+  // readback; the fence makes it host-visible, the host programs the
+  // slice copies on the transfer queue, and the next compute segment
+  // waits on the transfer signal on device (timeline semaphore — no
+  // host-side copy wait). Dev-resident visits never split a segment.
+  //
+  // split_stg_: segs_ layout is [S0, A0, B0, A1, B1, ...] — the fenced
+  // segs sit at even indices (segs_[2k] ends with boundary k's ids), the
+  // odd segs_[2k+1] hold boundary k's w13 GEMV phase gated on the w13
+  // transfer; the w2 transfer streams while that w13 segment runs.
+  const size_t nst = staged_layer_.size();
+  const auto seg_i = [&](size_t k) { return split_stg_ ? 2 * k : k; };
+  auto do_trec = [&](size_t k, int part, uint64_t* out_v) -> bool {
+    ink::vk::Recorder* tr =
+        (part == 1 ? trec13_ : trec2_)[k].get();
+    if (!tr->begin(tpool_)) {
+      err_ = "transfer recorder begin failed: " + tr->error();
       return false;
     }
-    rec_ = &rec;
-    if (ts_en_) {
-      if (!ts_head) {
-        // slot 0 = cb0 start; slots 1.. = one mark after each recorded op.
-        rec_->reset_query_pool(ts_pool_, 0, ts_cap_);
-        rec_->write_timestamp(ts_pool_, 0);
-        ts_next_ = 1;
-        ts_head = true;
-      } else {
-        ts_gap();  // cb-start mark; segment = the inter-submit gap
-      }
+    rec_ = tr;
+    ts_off_ = true;  // no timestamps on the transfer queue
+    stage_copies(lw_[staged_layer_[k]], part);
+    ts_off_ = false;
+    rec_ = nullptr;
+    if (!tr->end()) {
+      err_ = "transfer recorder end failed";
+      return false;
     }
-    rec_open = true;
-    return true;
-  };
-  auto submit_cb = [&]() -> bool {
-    if (tpend) {
-      // the copies this cb consumes must be done before it is submitted
-      if (!trec.wait()) {
-        err_ = "stage copy wait failed";
+    if (tl_en_) {
+      const uint64_t v = ++tl_val_;
+      if (!ctx_->submit_timeline(ctx_->copy_queue(), tr->cb(), nullptr,
+                                 nullptr, 0, &tl_sem_, &v, 1,
+                                 VK_NULL_HANDLE)) {
+        err_ = "stage copy submit failed: " + ctx_->last_error;
         return false;
       }
-      trec.shutdown();
-      tpend = false;
-    }
-    const auto w0 = clk::steady_clock::now();
-    if (!rec.submit_and_wait(ctx_->compute_queue)) {
-      err_ = "token submit failed: " + rec.error();
+      if (out_v) *out_v = v;
+    } else if (!tr->submit(ctx_->copy_queue())) {
+      err_ = "stage copy submit failed: " + tr->error();
       return false;
     }
+    stats.submits++;
+    return true;
+  };
+  uint64_t tl_a = 0, tl_b = 0;
+  for (size_t k = 0; k <= nst && !fail; k++) {
+    if (!tl_en_ && k > 0) {
+      // No timeline semaphores: keep the old host-side ordering — wait the
+      // staged copies before the dependent compute submit.
+      if (!trec13_[k - 1]->wait()) {
+        err_ = "stage copy wait failed";
+        fail = true;
+        break;
+      }
+    }
+    const auto w0 = clk::steady_clock::now();
+    const uint64_t wv = tl_en_ && k > 0 ? (split_stg_ ? tl_b : tl_val_) : 0;
+    const VkSemaphore* ws = (tl_en_ && k > 0) ? &tl_sem_ : nullptr;
+    const VkFence f = seg_fence_;
+    if (!ctx_->submit_timeline(ctx_->compute_queue, segs_[seg_i(k)]->cb(),
+                               ws, &wv, ws ? 1u : 0u, nullptr, nullptr, 0,
+                               f)) {
+      err_ = "token submit failed: " + ctx_->last_error;
+      fail = true;
+      break;
+    }
+    stats.submits++;
+    {
+      // The sentinel fill is the cb's last command: a host spin on the
+      // mapped dword unblocks a wake-latency earlier than any fence would
+      // (and is the ONLY readiness check for the boundary segments).
+      const int sen_idx = (k == nst) ? 48 : staged_vidx_[k];
+      volatile uint32_t* sen = (volatile uint32_t*)(rb_ + rb_sen_);
+      const uint32_t want = uint32_t(sen_idx + 1);
+      const auto dl =
+          clk::steady_clock::now() + std::chrono::milliseconds(250);
+      while (sen[sen_idx] != want)
+        if (clk::steady_clock::now() > dl) break;
+    }
+    if (!ctx_->wait_fence(seg_fence_)) {
+      err_ = "token wait failed: " + ctx_->last_error;
+      fail = true;
+      break;
+    }
+    vkResetFences(ctx_->device, 1, &seg_fence_);
     stats.wait_ms +=
         clk::duration<double, std::milli>(clk::steady_clock::now() - w0)
             .count();
-    stats.submits++;
-    rec_ = nullptr;
-    rec.shutdown();
-    rec_open = false;
-    return true;
-  };
-
-  if (begin_cb()) {
-    emit_head(token, pos);
-    for (int s = 0; s < 48 && !fail; s++) {
-      if (s == 6)
-        emit_snap();
-      else if (s == 18)
-        emit_bank(1);
-      else if (s == 30)
-        emit_bank(2);
-      int i, p;
-      visit_ip(c, s, i, p);
-      emit_visit_a(i, p, pos);
-      const Lw& L = lw_[i];
-      if (!L.experts_dev && stage_ok_) {
-        // Staged visit: close the cb right after a(v)'s router-id copy,
-        // read the ids, then record+submit the slice copies on the
-        // transfer queue and open the next compute cb for b(v).
-        if (!submit_cb()) {
-          fail = true;
-          break;
-        }
-        alloc_->invalidate(readback_, VkDeviceSize(rb_ids_) * 4, 32);
-        std::memcpy(stage_ids_, rb_ + rb_ids_, 32);
-        if (!trec.begin(tpool_)) {
-          err_ = "transfer recorder begin failed: " + trec.error();
-          fail = true;
-          break;
-        }
-        rec_ = &trec;
-        ts_off_ = true;  // no timestamps on the transfer queue
-        stage_copies(L);
-        ts_off_ = false;
-        rec_ = nullptr;
-        if (!trec.submit(ctx_->copy_queue())) {
-          err_ = "stage copy submit failed: " + trec.error();
-          fail = true;
-          break;
-        }
-        tpend = true;
-        if (!begin_cb()) {
-          fail = true;
-          break;
-        }
+    if (k == nst) break;
+    // The staged visit's ids are final: program its slice copies.
+    alloc_->invalidate(readback_, VkDeviceSize(rb_ids_) * 4, 32);
+    std::memcpy(stage_ids_, rb_ + rb_ids_, 32);
+    if (split_stg_) {
+      // w13 copies -> tl_a, then the w13-phase segment (unfenced — the
+      // compute queue runs it while the w2 copies stream behind it).
+      if (!do_trec(k, 1, &tl_a)) { fail = true; break; }
+      if (!ctx_->submit_timeline(ctx_->compute_queue,
+                                 segs_[2 * k + 1]->cb(), &tl_sem_, &tl_a, 1,
+                                 nullptr, nullptr, 0, VK_NULL_HANDLE)) {
+        err_ = "w13 phase submit failed: " + ctx_->last_error;
+        fail = true;
+        break;
       }
-      emit_visit_b(i, p);
+      stats.submits++;
+      // w2 copies -> tl_b; segs_[2k+2] (submitted next iteration) waits it.
+      if (!do_trec(k, 2, &tl_b)) { fail = true; break; }
+    } else {
+      if (!do_trec(k, 0, nullptr)) { fail = true; break; }
     }
-    if (!fail) {
-      emit_fin();
-      fail = !submit_cb();
-    }
-  } else {
-    fail = true;
   }
-  if (tpend) {  // cleanup on the fail path; submit succeeded -> safe wait
-    trec.wait();
-    tpend = false;
-  }
-  trec.shutdown();  // no-op if never began; safe after wait/never-submitted
-  if (rec_open) {
-    rec_ = nullptr;
-    rec.shutdown();
-    rec_open = false;
+  if (!fail) {
+    // The final compute fence implies every transfer signal was consumed,
+    // so this token's copy cbs are finished — free them before next begin.
+    for (auto& tr : trec13_)
+      if (tr->cb()) tr->shutdown();
+    for (auto& tr : trec2_)
+      if (tr->cb()) tr->shutdown();
   }
   stats.record_ms +=
       clk::duration<double, std::milli>(clk::steady_clock::now() - t0)
@@ -1155,7 +1343,8 @@ bool GpuGraph::init(const ModelConfig& c, const WeightStore& w,
   rb_vis_ = V_ + 4 * H;
   rb_dbg_ = rb_vis_ + 96 * H;
   rb_ids_ = rb_dbg_ + 16 * H;  // 8 int32 router top-k ids (expert staging)
-  readback_ = alloc.alloc_host((rb_ids_ + 8) * 4);
+  rb_sen_ = rb_ids_ + 8;       // 64 sentinel dwords for the ids-ready spins
+  readback_ = alloc.alloc_host((rb_sen_ + 64) * 4);
   if (!readback_.buf) {
     *err = "gpu backend: readback alloc failed: " + alloc.last_error;
     return false;
@@ -1172,12 +1361,12 @@ bool GpuGraph::init(const ModelConfig& c, const WeightStore& w,
       load_pipe("matvec_f32", 3, sizeof(sh::PcMatvec), p_mvf_) &&
       load_pipe("matvec_bf16", 3, sizeof(sh::PcMatvec), p_mvb_) &&
       load_pipe("matvec_f8e4m3", 3, sizeof(sh::PcMatvec), p_mv8_) &&
-      load_pipe("conv4_static", 4, sizeof(sh::PcConv4Static), p_cvs_) &&
-      load_pipe("conv4_dynamic", 5, sizeof(sh::PcConv4Dyn), p_cvd_) &&
+      load_pipe("conv4_static", 5, sizeof(sh::PcConv4Static), p_cvs_) &&
+      load_pipe("conv4_dynamic", 6, sizeof(sh::PcConv4Dyn), p_cvd_) &&
       load_pipe("rel_bias", 3, sizeof(sh::PcRelBias), p_rel_) &&
-      load_pipe("attn_scores", 4, sizeof(sh::PcAttnScores), p_sco_) &&
-      load_pipe("attn_softmax", 2, sizeof(sh::PcAttnSoftmax), p_smx_) &&
-      load_pipe("attn_accum", 3, sizeof(sh::PcAttnAccum), p_acc_) &&
+      load_pipe("attn_scores", 5, sizeof(sh::PcAttnScores), p_sco_) &&
+      load_pipe("attn_softmax", 3, sizeof(sh::PcAttnSoftmax), p_smx_) &&
+      load_pipe("attn_accum", 4, sizeof(sh::PcAttnAccum), p_acc_) &&
       load_pipe("attn_res", 3, sizeof(sh::PcAttnRes), p_ares_) &&
       load_pipe("msg_gate", 6, sizeof(sh::PcMsgGate), p_msg_) &&
       load_pipe("router", 5, sizeof(sh::PcRouter), p_rtr_) &&
@@ -1190,8 +1379,9 @@ bool GpuGraph::init(const ModelConfig& c, const WeightStore& w,
       load_pipe("softcap", 1, sizeof(PcCap), p_cap_) &&
       load_pipe("vadd", 3, sizeof(PcN), p_add_) &&
       load_pipe("l2_clip", 2, sizeof(PcClip), p_l2_) &&
-      load_pipe("log_scale", 1, sizeof(PcTau), p_log_) &&
-      load_pipe("embed_norm", 3, sizeof(PcEmb), p_emb_) &&
+      load_pipe("log_scale", 2, sizeof(PcTau), p_log_) &&
+      load_pipe("embed_norm", 4, sizeof(PcEmb), p_emb_) &&
+      load_pipe("kv_append", 5, sizeof(PcN), p_kva_) &&
       load_pipe("matvec_nvfp4_slot", 7, sizeof(sh::PcNvfp4), p_nv4s_) &&
       load_pipe("matvec_mxfp8_slot", 5, sizeof(sh::PcMxfp8), p_mx8s_) &&
       load_pipe("matvec_nvfp4_stage", 7, sizeof(sh::PcNvfp4), p_nv4st_) &&
@@ -1497,15 +1687,58 @@ bool GpuGraph::init(const ModelConfig& c, const WeightStore& w,
     }
   }
 
+  // --------------------- record-once replay state ---------------------
+  // params_: host-coherent GpuParamsRow[49] bound as the last binding of
+  // every shader that needs a token-varying scalar (see bindings.h). Try
+  // the ReBAR device-local host-visible heap first, plain host staging
+  // memory as fallback.
+  prm_stride_ =
+      std::max<VkDeviceSize>(64, ctx.props.limits
+                                     .minStorageBufferOffsetAlignment);
+  params_ = alloc.alloc_bar_visible(
+      VkDeviceSize(sh::GPU_PARAMS_ROWS) * prm_stride_);
+  if (!params_.buf)
+    params_ =
+        alloc.alloc_host(VkDeviceSize(sh::GPU_PARAMS_ROWS) * prm_stride_);
+  if (!params_.buf || !(prm_ = alloc.mapped(params_))) {
+    *err = "gpu backend: params alloc failed: " + alloc.last_error;
+    return false;
+  }
+  std::memset(prm_, 0, VkDeviceSize(sh::GPU_PARAMS_ROWS) * prm_stride_);
+  // cache slot -> layer kind (attn window + slot->full for j0/n)
+  for (int s = 0; s < 48; s++) {
+    int i, p;
+    visit_ip(c, s, i, p);
+    slot_full_[c.cache_slot(i, p)] = c.is_full_attn(i) ? 1 : 0;
+  }
+  pstride_ = uint32_t(cap_ + 8);   // fixed probs row stride
+  score_gy_ = wg64(cap_);          // attn_scores grid covers any n <= cap
+  seg_fence_ = ctx_->create_fence();
+  tl_en_ = ctx_->feats.timeline_semaphore;
+  if (tl_en_) tl_sem_ = ctx_->create_timeline_semaphore(0);
+  // Two-phase staging only pays off when the slice copies can truly run
+  // while compute executes: dedicated SDMA queue + device-side ordering.
+  split_stg_ = tl_en_ && ctx_->has_dedicated_transfer();
+  if (!seg_fence_ || (tl_en_ && !tl_sem_)) {
+    *err = "gpu backend: fence/semaphore create failed: " +
+           ctx_->last_error;
+    return false;
+  }
+
   logits_host_.assign(size_t(V_), 0.f);
   building_ = true;
   emit_token(0, 0);
   building_ = false;
-  reset();
   if (!err_.empty()) {
     *err = "gpu backend: descriptor build failed: " + err_;
     return false;
   }
+  // Record walk: persistent per-segment cbs resubmitted every token.
+  if (!record_segments()) {
+    *err = "gpu backend: segment record failed: " + err_;
+    return false;
+  }
+  reset();
   ok_ = true;
   return true;
 }
@@ -1527,13 +1760,26 @@ void GpuGraph::shutdown() {
   f32w_.clear();
   for (auto& ds : sites_) ds.shutdown(*ctx_);
   sites_.clear();
+  for (auto& s : segs_) s->shutdown();
+  segs_.clear();
+  for (auto& t : trec13_) t->shutdown();
+  for (auto& t : trec2_) t->shutdown();
+  trec13_.clear();
+  trec2_.clear();
+  staged_layer_.clear();
+  staged_vidx_.clear();
+  if (seg_fence_) ctx_->destroy_fence(seg_fence_);
+  seg_fence_ = VK_NULL_HANDLE;
+  if (tl_sem_) ctx_->destroy_semaphore(tl_sem_);
+  tl_sem_ = VK_NULL_HANDLE;
   vk::Buffer* bufs[] = {&staging_, &dummy4_, &partial_, &block_,
                         &pre_partial_, &pre_block_, &bank_, &reads_, &msgs_,
                         &mgated_, &inbuf_, &q_, &k_, &v_, &r_, &tk_, &tv_,
                         &rel_, &probs_, &grate_, &sink_, &o_, &attn_out_,
                         &a_out_, &residual_, &m_in_, &mn_, &moe_out_, &mo_,
                         &ridx_, &rw_, &gate_, &up_, &kvk_, &kvv_, &hist_, &h_,
-                        &hfin_, &logits_, &readback_, &embedw_, &embn_,
+                        &hfin_, &logits_, &readback_, &params_, &embedw_,
+                        &embn_,
                         &normw_, &unembw_, &attnq_, &mlpq_, &msgq_, &outq_,
                         &stg_w13w_, &stg_w13s_, &stg_w2w_, &stg_w2s_};
   for (auto* b : bufs)
@@ -1543,7 +1789,7 @@ void GpuGraph::shutdown() {
                    &p_rtr_, &p_moe_, &p_mred_, &p_moem_, &p_nv4m_, &p_mx8m_,
                    &p_sig_, &p_cap_, &p_add_, &p_l2_,
                    &p_log_, &p_emb_, &p_nv4s_, &p_mx8s_,
-                   &p_nv4st_, &p_mx8st_, &p_moest_};
+                   &p_nv4st_, &p_mx8st_, &p_moest_, &p_kva_};
   for (auto* p : pipes) p->p.shutdown();
   cpool_.shutdown();
   tpool_.shutdown();

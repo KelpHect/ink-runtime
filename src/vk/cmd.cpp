@@ -130,6 +130,11 @@ void Recorder::copy_buffer(VkBuffer src, VkBuffer dst, VkDeviceSize size,
   vkCmdCopyBuffer(cb_, src, dst, 1, &r);
 }
 
+void Recorder::copy_buffer_regions(VkBuffer src, VkBuffer dst,
+                                   const VkBufferCopy* regs, uint32_t n) {
+  vkCmdCopyBuffer(cb_, src, dst, n, regs);
+}
+
 void Recorder::fill_buffer(VkBuffer dst, VkDeviceSize off, VkDeviceSize size,
                            uint32_t data) {
   vkCmdFillBuffer(cb_, dst, off, size, data);

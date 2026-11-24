@@ -48,6 +48,9 @@ class Recorder {
   // SDMA path: vkCmdCopyBuffer on whatever queue this is submitted to.
   void copy_buffer(VkBuffer src, VkBuffer dst, VkDeviceSize size,
                    VkDeviceSize src_off = 0, VkDeviceSize dst_off = 0);
+  // Same, with a region array — one driver packet for many slices.
+  void copy_buffer_regions(VkBuffer src, VkBuffer dst,
+                           const VkBufferCopy* regs, uint32_t n);
   // vkCmdFillBuffer (TRANSFER write) — e.g. zeroing an accumulator mid-cb.
   void fill_buffer(VkBuffer dst, VkDeviceSize off, VkDeviceSize size,
                    uint32_t data = 0);

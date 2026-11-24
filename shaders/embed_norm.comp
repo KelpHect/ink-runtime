@@ -17,9 +17,14 @@ layout(local_size_x = 64) in;
 layout(set = 0, binding = 0, std430) readonly buffer EBuf { uint  e[]; }; // [V,n] packed
 layout(set = 0, binding = 1, std430) readonly buffer GBuf { float g[]; }; // [n] gamma
 layout(set = 0, binding = 2, std430) writeonly buffer OBuf { float o[]; };// [n]
+// record-once decode: header params row (offset 48*64) carries the token id
+layout(set = 0, binding = 3, std430) readonly buffer PrmBuf {
+    uint prm_token; float prm_tau; uint prm_pos; uint prm_kv_len;
+    uint prm_j0; uint prm_n; uint prm_filled[4];
+} prm;
 
 layout(push_constant) uniform Pc {
-    uint  token;
+    uint  token;   // dead under record-once decode (prm.prm_token is read)
     uint  n;
     float eps;
     uint  flags;   // bit0: SRC_BF16
@@ -28,12 +33,12 @@ layout(push_constant) uniform Pc {
 shared float red[64];
 shared float rstd;
 
-float emb_at(uint d) {   // element d of row `token`
+float emb_at(uint d) {   // element d of row `prm_token`
     if ((pc.flags & 1u) != 0u) {
-        uint idx = pc.token * pc.n + d;               // u16 element index
+        uint idx = prm.prm_token * pc.n + d;               // u16 element index
         return uintBitsToFloat(((e[idx >> 1] >> ((idx & 1u) * 16u)) & 0xFFFFu) << 16);
     }
-    return uintBitsToFloat(e[pc.token * pc.n + d]);   // f32 bit pattern
+    return uintBitsToFloat(e[prm.prm_token * pc.n + d]);   // f32 bit pattern
 }
 
 void main() {

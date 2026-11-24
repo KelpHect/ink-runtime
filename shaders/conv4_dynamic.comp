@@ -23,11 +23,16 @@ layout(set = 0, binding = 1, std430) readonly buffer SBuf  { float sw[]; };
 layout(set = 0, binding = 2, std430) readonly buffer DBuf  { float dyn[]; };
 layout(set = 0, binding = 3, std430) buffer HBuf           { float hs[]; };
 layout(set = 0, binding = 4, std430) writeonly buffer OBuf { float o[]; };
+// record-once decode: this visit's slot params row carries filled[stream]
+layout(set = 0, binding = 5, std430) readonly buffer PrmBuf {
+    uint prm_token; float prm_tau; uint prm_pos; uint prm_kv_len;
+    uint prm_j0; uint prm_n; uint prm_filled[4];
+} prm;
 
 layout(push_constant) uniform Pc {
     uint C;
     uint head_dim;
-    uint filled;
+    uint filled;   // record-once: STREAM index 0..3 into prm_filled
     uint flags;    // bit0: UPDATE history
 } pc;
 
@@ -36,14 +41,15 @@ const float INV3 = 0.3333333333333333;
 void main() {
     const uint c = gl_GlobalInvocationID.x;
     if (c >= pc.C) return;
+    const uint filled = prm.prm_filled[pc.filled];
 
     const uint hh = (c / pc.head_dim) * 4u;   // dyn base for this channel's head
     const float xv = x[c];
 
     float acc = (sw[0u * pc.C + c] + dyn[hh + 0u]) * xv;                    // lag 0 = current
-    if (pc.filled > 0u) acc += (sw[1u * pc.C + c] + dyn[hh + 1u]) * hs[c * 3u + 0u];
-    if (pc.filled > 1u) acc += (sw[2u * pc.C + c] + dyn[hh + 2u]) * hs[c * 3u + 1u];
-    if (pc.filled > 2u) acc += (sw[3u * pc.C + c] + dyn[hh + 3u]) * hs[c * 3u + 2u];
+    if (filled > 0u) acc += (sw[1u * pc.C + c] + dyn[hh + 1u]) * hs[c * 3u + 0u];
+    if (filled > 1u) acc += (sw[2u * pc.C + c] + dyn[hh + 2u]) * hs[c * 3u + 1u];
+    if (filled > 2u) acc += (sw[3u * pc.C + c] + dyn[hh + 3u]) * hs[c * 3u + 2u];
     o[c] = (acc + xv) * INV3;
 
     if ((pc.flags & 1u) != 0u) {

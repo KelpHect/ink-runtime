@@ -12,14 +12,19 @@
 layout(local_size_x = 64) in;
 
 layout(set = 0, binding = 0, std430) buffer VBuf { float v[]; };  // [n] rw
+// record-once decode: header params row (offset 48*64) carries tau
+layout(set = 0, binding = 1, std430) readonly buffer PrmBuf {
+    uint prm_token; float prm_tau; uint prm_pos; uint prm_kv_len;
+    uint prm_j0; uint prm_n; uint prm_filled[4];
+} prm;
 
 layout(push_constant) uniform Pc {
     uint  n;
-    float tau;
+    float tau;   // dead under record-once decode (prm.prm_tau is read)
 } pc;
 
 void main() {
     const uint i = gl_GlobalInvocationID.x;
     if (i >= pc.n) return;
-    v[i] *= pc.tau;
+    v[i] *= prm.prm_tau;
 }

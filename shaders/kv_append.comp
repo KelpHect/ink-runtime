@@ -1,0 +1,37 @@
+#version 460
+
+// kv_append.comp — append the current token's K/V rows into this visit's
+// cache-slot bank (record-once decode).
+//
+// Replaces the two per-visit vkCmdCopyBuffer appends (k_ -> kvk_, v_ -> kvv_)
+// whose recorded destination offset could not track the per-token kv_len:
+// vkCmdCopyBuffer offsets are baked at record time, so the append is a
+// dispatch that reads kv_len from the slot's params row instead.
+//   kvk[kv_len*C + c] = kin[c];   kvv[kv_len*C + c] = vin[c]
+// The banks are bound as the same per-slot slices attn_scores/attn_accum
+// read (kvb(): slot*cap*C floats base, cap*C floats range). kv_len < cap is
+// a host-side invariant (--ctx bounds the sequence length).
+//
+// grid.x = ceil(C/64), one thread per channel; C = HK*DH = 1024.
+// PC {uint C}.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer KBuf  { float kin[]; };
+layout(set = 0, binding = 1, std430) readonly buffer VBuf  { float vin[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer KKBuf { float kvk[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer KVBuf { float kvv[]; };
+layout(set = 0, binding = 4, std430) readonly buffer PrmBuf {
+    uint prm_token; float prm_tau; uint prm_pos; uint prm_kv_len;
+    uint prm_j0; uint prm_n; uint prm_filled[4];
+} prm;
+
+layout(push_constant) uniform Pc { uint C; } pc;
+
+void main() {
+    const uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.C) return;
+    const uint dst = prm.prm_kv_len * pc.C + c;
+    kvk[dst] = kin[c];
+    kvv[dst] = vin[c];
+}

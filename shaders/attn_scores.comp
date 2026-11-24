@@ -22,24 +22,30 @@ layout(set = 0, binding = 0, std430) readonly buffer QBuf  { float q[]; };
 layout(set = 0, binding = 1, std430) readonly buffer KBuf  { float k[]; };
 layout(set = 0, binding = 2, std430) readonly buffer RLBuf { float rel[]; };
 layout(set = 0, binding = 3, std430) writeonly buffer PBuf { float p[]; };
+// record-once decode: this visit's slot params row carries j0/n/pos so the
+// same dispatch (fixed grid over the whole capacity) runs every token.
+layout(set = 0, binding = 4, std430) readonly buffer PrmBuf {
+    uint prm_token; float prm_tau; uint prm_pos; uint prm_kv_len;
+    uint prm_j0; uint prm_n; uint prm_filled[4];
+} prm;
 
 layout(push_constant) uniform Pc {
     uint hq;      // query heads (24)
     uint hk;      // kv heads (8)
     uint dh;      // head_dim (128)
-    uint j0;      // window start (len-window for sliding, 0 for full)
-    uint n;       // window length = len - j0
-    uint pos;     // absolute query position (cache index of current token)
+    uint j0;      // dead under record-once decode (prm_j0 is read)
+    uint n;       // dead (prm_n)
+    uint pos;     // dead (prm_pos)
     uint ext;     // rel_extent (1024)
-    uint pstride; // row stride of p (>= n+1)
+    uint pstride; // row stride of p (fixed = capacity + 8)
 } pc;
 
 void main() {
     const uint h  = gl_WorkGroupID.x;
     const uint jj = gl_WorkGroupID.y * 64u + gl_LocalInvocationID.x;  // window offset
-    if (jj >= pc.n) return;
+    if (jj >= prm.prm_n) return;
 
-    const uint j  = pc.j0 + jj;
+    const uint j  = prm.prm_j0 + jj;
     const uint g  = h * pc.hk / pc.hq;
     const float scale = 1.0 / sqrt(float(pc.dh));
 
@@ -49,7 +55,7 @@ void main() {
     for (uint d = 0u; d < pc.dh; d++) s += q[qb + d] * k[kb + d];
     s *= scale;
 
-    const int dd = int(pc.pos) - int(j);
+    const int dd = int(prm.prm_pos) - int(j);
     if (dd >= 0 && dd < int(pc.ext)) s += rel[h * pc.ext + uint(dd)];
 
     p[h * pc.pstride + jj] = s;
