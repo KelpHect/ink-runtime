@@ -56,21 +56,30 @@ No math-rate fuse on AMD. Gains are platform/software:
 | RAS/ECC off if enabled | ~+9% BW on R9700 sibling; verify on consumer | free if present |
 | Keep GPU saturated (fused kernels, prerecorded cmd bufs) | avoids mclk 96↔1258 bounce | design |
 | WMMA coverage of every GEMM/attention | up to 4× vs scalar pipe (195→780 TF sparse FP8); the real "unlock" | kernel work |
-| FP8 WMMA (HIP path) | 2× FP16 rate for MXFP8 layers | backend work |
+| FP8 WMMA | 2× FP16 rate for MXFP8 layers | **works in Vulkan on this driver** — verified |
 
 ## 5. API decision
 
-**Vulkan compute primary** (Windows): zero install friction (Adrenalin = the runtime), coopmat fp16/bf16/int8 confirmed on this driver, decode ≈ parity with HIP, portable to Linux/RADV where it wins MoE decode. **HIP SDK 7.2 secondary**: the only path to native FP8 WMMA (+2× on MXFP8 layers) and real profiling; also the Linux dev target. D3D12/DML out (no stable WMMA until SM6.10); DirectStorage unnecessary (replicate its ring in ~200 lines, and it's D3D12-bound). Kernels behind a vtable; Slang as shader language (one source → SPIR-V now, DXIL later).
+**Vulkan compute primary** (Windows): zero install friction (Adrenalin = the runtime), decode ≈ parity with HIP, portable to Linux/RADV where it wins MoE decode. **Measured coopmat configs on this box** (`research/probe-coopmat.txt`, vkprobe.exe): 18 configs, all 16×16×16 subgroup-scope — f16→f32/f16, i8/u8→i32 (all sign combos), **f8e4m3×f8e4m3→f32 + e4m3/e5m2 cross**, bf16→bf16/f32. So **native FP8 WMMA works on the Adrenalin prop driver** — research flagged this "unverified"; it is now verified, and the earlier plan to need HIP for FP8 is obsolete. HIP SDK 7.2 remains secondary only for profiling/perf counters, not required for the fast path. D3D12/DML out (no stable WMMA until SM6.10); DirectStorage unnecessary. Kernels behind a vtable; Slang as shader language (one source → SPIR-V now, DXIL later).
 
 ## 6. Kernel plan
 
 - **NVFP4**: no FP4 instruction on gfx1201 → dequant-fused GEMV (wave64, `v_dot4`/`v_bfe` unpack, E4M3-block×fp32-global scale in epilogue) for decode; dequant→bf16 WMMA (wave32) for prefill. Alternative: INT4-WMMA reinterpretation (779 TOPS) — benchmark both.
-- **MXFP8**: native E4M3 → FP8 WMMA (HIP) or FP8→BF16 convert (Vulkan until FP8-coopmat enumerates).
+- **MXFP8**: native E4M3 → FP8 coopmat in Vulkan directly (verified above); no bf16 round-trip needed. For decode GEMV (M=1) WMMA doesn't apply — use `v_dot` scalar fp8→fp32 dot or unpack to bf16; the win is at M≥16 (draft-verify batch, prefill, MTP chain).
 - **Attention**: custom kernel mandatory (SWA 1024 + QK-L2 clip + softcap 30 + rel-pos d_rel=16 + learned sink). Base: ck_tile FMHA (SWA + softcap already templated, HIP); Vulkan port of same structure. wave64.
 - **MoE exec**: dequant-fused per-expert GEMV at decode (M=1–9 — bandwidth-bound, skip grouped-GEMM padding); grouped GEMM (BLOCK_M) for prefill; `moe_sorting` (aiter) as reference.
 - **Dispatch overhead**: ~7k launches/token kills naive backends (73% GPU time in kTransformers profile) → pre-recorded command buffers per shape (decode/draft-verify/prefill-bucket), timeline semaphores, dedicated transfer queue for H2D.
 
-**RAM caveat (measured on this box)**: 48GB = 2×8GB DDR4-2666 + 2×16GB DDR4-3200 mismatched → all run at 2666 MT/s in flex-asymmetric mode → ~40 GB/s tier bandwidth, ~half the assumed DDR5 budget. Consequences: (a) PCIe-5 streaming (~50 GB/s) beats CPU-side expert compute (~25–35 GB/s delivered) — invert the Fiddler default: prefer H2D copies for misses, keep CPU-exec only for truly-late fp8-tail misses or when PCIe is saturated; (b) an XMP bump to 3200 is capped by the slow sticks — treat ~40 GB/s as the planning number; (c) the RAM tier still holds the full 15.7GB expert mirror + fp8 KV — capacity is unaffected, only its bandwidth.
+**RAM caveat (measured on this box)**: 48GB = 2×8GB DDR4-2666 + 2×16GB DDR4-3200 mismatched → all run at 2666 MT/s in flex-asymmetric mode → ~40 GB/s tier bandwidth, ~half the assumed DDR5 budget. Consequences: (a) PCIe-5 streaming beats CPU-side expert compute — invert the Fiddler default: prefer H2D copies for misses, keep CPU-exec only for truly-late fp8-tail misses or when PCIe is saturated; (b) an XMP bump to 3200 is capped by the slow sticks — treat ~40 GB/s as the planning number; (c) the RAM tier still holds the full 15.7GB expert mirror + fp8 KV — capacity is unaffected, only its bandwidth.
+
+**H2D bandwidth — measured** (`research/probe-h2d-bench.txt`, vkbench.exe, 256MiB × best-of-8):
+| Path | GB/s | Note |
+|---|---|---|
+| `vkCmdCopyBuffer` RAM→VRAM, dedicated transfer queue (SDMA) | **32.5** | the fast path — DMA reads host RAM; this number is the DDR4 read ceiling (~40 theo), not the Gen5 link |
+| `memset`/NT stores → ReBAR-mapped VRAM | 10.8 | viable fallback when staging isn't possible |
+| plain `memcpy` → ReBAR VRAM | 0.35 | temporal stores over WC memory — **never** do this |
+
+Implications: expert streaming tops out ~32 GB/s whatever we do (RAM-bound, not PCIe-bound); NVMe→RAM→VRAM two-hop stays (no GPUDirect-Storage on Windows/Vulkan); the loop gives ~11 layer-steps of prefetch runway which at 32 GB/s ≈ 350MB/runway — comfortably covers the ~23MB of 8 fp4 experts but tight for 8 fp8 experts (~66MB) on layers 20–23 → those need 2-layer lookahead or CPU-exec fallback.
 
 ## 7. The expert-tiering engine (the differentiator, ~1k LOC)
 

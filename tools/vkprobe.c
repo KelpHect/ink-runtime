@@ -59,25 +59,24 @@ int main(void){
     cmfeat.pNext = &fc;
     VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &cmfeat};
     vkGetPhysicalDeviceFeatures2(dev,&f2);
-    printf("cooperativeMatrix feature: %d (stages count=%u, stage0=0x%x)\n",
-        cmfeat.cooperativeMatrix, cmprops.cooperativeMatrixSupportedStages,
-        cmprops.cooperativeMatrixSupportedStages?cmprops.pCooperativeMatrixSupportedStages[0]:0);
+    printf("cooperativeMatrix feature: %d (stages=0x%x)\n",
+        cmfeat.cooperativeMatrix, cmprops.cooperativeMatrixSupportedStages);
     printf("shaderSignedZeroInfNanPreserveFloat16/32: %d/%d  denorm f16: %d/%d/%d\n",
         fc.shaderSignedZeroInfNanPreserveFloat16,fc.shaderSignedZeroInfNanPreserveFloat32,
         fc.shaderDenormPreserveFloat16,fc.shaderDenormFlushToZeroFloat16,fc.shaderRoundingModeRTEFloat16);
 
     /* config enumeration */
-    PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR_fn getcm =
-        (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR_fn)vkGetInstanceProcAddr(inst,"vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
+    PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR getcm =
+        (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)vkGetInstanceProcAddr(inst,"vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
     if(!getcm){puts("no coopmat props fn");return 1;}
     uint32_t n=0; getcm(dev,&n,0);
     VkCooperativeMatrixPropertiesKHR* cm = calloc(n,sizeof*cm);
     for(uint32_t i=0;i<n;i++) cm[i].sType=VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
     getcm(dev,&n,cm);
-    printf("coopmat configs: %u\n%-28s %-28s %-6s %-12s %-8s %s\n","A","B","C","Result","MxNxK","scope");
+    printf("coopmat configs: %u\n%-28s %-28s %-6s %-12s %-8s %s\n",n,"A","B","C","Result","MxNxK","scope");
     for(uint32_t i=0;i<n;i++){
         char ms[24],ns[24],ks[24];
-        snprintf(ms,24,"%s(%s)",ctype(cm[i].AType),cm[i].aStage?"":"");
+        snprintf(ms,24,"%s",ctype(cm[i].AType));
         snprintf(ns,24,"%s",ctype(cm[i].BType));
         snprintf(ks,24,"%s",ctype(cm[i].CType));
         printf("%-28s %-28s %-6s %-12s %ux%ux%u   %s\n",ms,ns,ks,ctype(cm[i].ResultType),

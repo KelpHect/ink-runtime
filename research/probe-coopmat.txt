@@ -1,0 +1,33 @@
+device: AMD Radeon RX 9070 XT  api 1.4.359
+cooperativeMatrix feature: 1 (stages=0x0)
+shaderSignedZeroInfNanPreserveFloat16/32: 0/0  denorm f16: 0/0/0
+coopmat configs: 18
+A                            B                            C      Result       MxNxK    scope
+f16                          f16                          f32    f32          16x16x16   subgroup
+f16                          f16                          f16    f16          16x16x16   subgroup
+f16                          f16                          f16    f16          16x16x16   subgroup
+u8                           u8                           i32    i32          16x16x16   subgroup
+u8                           u8                           i32    i32          16x16x16   subgroup
+u8                           i8                           i32    i32          16x16x16   subgroup
+u8                           i8                           i32    i32          16x16x16   subgroup
+i8                           u8                           i32    i32          16x16x16   subgroup
+i8                           u8                           i32    i32          16x16x16   subgroup
+i8                           i8                           i32    i32          16x16x16   subgroup
+i8                           i8                           i32    i32          16x16x16   subgroup
+f8e4m3                       f8e4m3                       f32    f32          16x16x16   subgroup
+f8e4m3                       f8e5m2                       f32    f32          16x16x16   subgroup
+f8e5m2                       f8e4m3                       f32    f32          16x16x16   subgroup
+f8e5m2                       f8e5m2                       f32    f32          16x16x16   subgroup
+bf16                         bf16                         bf16   bf16         16x16x16   subgroup
+bf16                         bf16                         bf16   bf16         16x16x16   subgroup
+bf16                         bf16                         f32    f32          16x16x16   subgroup
+
+queue families: 5
+  fam0 count=8 flags=0xf
+  fam1 count=8 flags=0xe
+  fam2 count=1 flags=0xc
+  fam3 count=1 flags=0x40
+  fam4 count=1 flags=0x20
+heaps: 2
+  heap0 size=31.79GiB budget=31.04GiB flags=0x0
+  heap1 size=15.92GiB budget=15.06GiB flags=0x3

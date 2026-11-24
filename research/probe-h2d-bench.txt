@@ -1,0 +1,6 @@
+device: AMD Radeon RX 9070 XT
+transfer family: 2 (count 1)
+memtypes host=1 bar=2 devlocal=0
+memcpy->VRAM (ReBAR, non-temporal stores): 10.77 GB/s
+memcpy->VRAM (plain memcpy):               0.35 GB/s
+vkCmdCopyBuffer RAM->VRAM (SDMA, best of 8): 32.51 GB/s
