@@ -69,3 +69,17 @@ Ceilings/budgets: `docs/THEORY.md`. Model facts: `research/00-model-facts.md`.
 - `research/00` model facts · `01` hw deep-dive · `02` 3090-unlock+AMD analogs · `03` ROCm · `04` GPU APIs · `05` tiered runtimes · `06` NVFP4 formats · `08` MTP/draft · `09` KV · `10` NVMe I/O · `11` MoE streaming · `12` measured bandwidth · `13` ecosystem · `14` C++ arch patterns · `07` internals (pending)
 - `docs/THEORY.md` ceilings · `docs/RUNTIME_PLAN.md` this file
 - `vendor/Strata/` reference engine (Apache — check license before cribbing code)
+
+## P2a/b done (2026-xx): device-resident forward
+
+`--backend gpu` (src/gpu/gpu_graph.*): whole 48-visit forward is one static
+descriptor stream + prerecorded cb; 1 submit/token (~0.3 s/tok wall on
+Adrenalin, ~0.27s GPU-wait/token). Expert selection consumed on-device via
+`*_slot` shader variants (router idx read in-shader). GATE PASS 8/8 argmax,
+worst cos 0.9857.
+
+Bugs found gating it: compare tools ignored argv (all early PASSes were
+against stale dumps — comparator must be invoked with real paths); gpu xo[]
+byte-vs-element offset => full-layer k/v/wproj OOB; block_[0] unseeded at
+i==0. INK_DBG=1 now dumps per-stage intermediates for visit5 on both CPU and
+GPU backends (16-row debug region appended to readback).
