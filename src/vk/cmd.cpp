@@ -153,6 +153,17 @@ void Recorder::compute_barrier() {
           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
 }
 
+void Recorder::write_timestamp(VkQueryPool pool, uint32_t slot,
+                               VkPipelineStageFlags stage) {
+  vkCmdWriteTimestamp(cb_, static_cast<VkPipelineStageFlagBits>(stage), pool,
+                      slot);
+}
+
+void Recorder::reset_query_pool(VkQueryPool pool, uint32_t first,
+                                uint32_t count) {
+  vkCmdResetQueryPool(cb_, pool, first, count);
+}
+
 bool Recorder::end() {
   if (!recording_) return fail("Recorder::end without begin");
   if (ended_) return true;

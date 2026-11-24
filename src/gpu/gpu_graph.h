@@ -60,6 +60,7 @@ class GpuGraph {
  private:
   struct Pipe {
     ink::vk::ComputePipeline p;
+    const char* name = "";  // spv name, for INK_GPU_TS labels
   };
   struct WB {  // matvec weight: uploaded buffer + dtype-picked pipeline
     const ink::vk::Buffer* b = nullptr;
@@ -102,10 +103,14 @@ class GpuGraph {
   // site sequence is identical.
   const ink::vk::DescSet& dset(const Pipe& p, std::initializer_list<Bnd> bs);
   void op(const Pipe& p, std::initializer_list<Bnd> bs, const void* pc,
-          uint32_t pcb, uint32_t gx, uint32_t gy = 1);
-  void mv(const Pipe& p, Bnd w, Bnd x, Bnd o, int64_t M, int64_t K);
+          uint32_t pcb, uint32_t gx, uint32_t gy = 1,
+          const char* tag = nullptr);
+  void mv(const Pipe& p, Bnd w, Bnd x, Bnd o, int64_t M, int64_t K,
+          const char* tag = nullptr);
   void cp(const ink::vk::Buffer& s, VkDeviceSize so, const ink::vk::Buffer& d,
-          VkDeviceSize dof, VkDeviceSize sz);
+          VkDeviceSize dof, VkDeviceSize sz, const char* tag = nullptr);
+  void fill(const ink::vk::Buffer& d, VkDeviceSize off, VkDeviceSize sz,
+            uint32_t data, const char* tag = nullptr);
   void sync();  // full pipeline barrier (correctness-first)
   Bnd histb(int slot, int stream, int C) const;
   Bnd kvb(const ink::vk::Buffer& cache, int slot) const;
@@ -154,6 +159,33 @@ class GpuGraph {
   size_t site_cursor_ = 0;
   bool building_ = false;
   ink::vk::Recorder* rec_ = nullptr;
+
+  // ---- INK_GPU_TS=1: GPU timestamps inside the recorded token cb ----
+  // One timestamp at cb start plus one after every op/mv/cp/fill. The op
+  // sequence is token-invariant, so segment labels are built once (first
+  // emit) and indexed by slot afterwards. Everything here is inert unless
+  // the env var is set: no writes reach the command buffer otherwise.
+  void ts_mark(const char* name, const char* tag);
+  void ts_collect();
+  void ts_report() const;
+  struct TsSeg {
+    std::string label;   // "<scope>/<role>" e.g. "v5/wk", "fin/unemb"
+    uint8_t cls;         // 0 matvec,1 conv4,2 attn,3 moe,4 elementwise,5 copy
+    uint8_t phase;       // 0 prelude,1-3 pass0-2,4 coda,5 final
+    double ms = 0;       // summed GPU time across collected tokens
+  };
+  bool ts_en_ = false;
+  VkQueryPool ts_pool_ = VK_NULL_HANDLE;
+  uint32_t ts_cap_ = 0;    // pool slots allocated
+  uint32_t ts_next_ = 0;   // next query slot during an emit (slot0=cb start)
+  double ts_period_ = 0;   // ns per timestamp tick
+  uint64_t ts_tokens_ = 0;
+  double ts_gpu_ms_ = 0;                    // summed busy ms (seg deltas)
+  std::vector<uint64_t> ts_raw_;            // query result scratch
+  std::vector<TsSeg> ts_segs_;              // one per timestamp boundary
+  std::unordered_map<std::string, int> ts_dup_;  // label dedup, first emit
+  std::string cur_scope_;                  // "v<vidx>" / "pre" / "bank" / "fin"
+  uint8_t cur_phase_ = 0;
 
   // host-side counters — mirror ops::CacheSlot bookkeeping
   int64_t kv_len_[48] = {};

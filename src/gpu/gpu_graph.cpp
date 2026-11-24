@@ -30,6 +30,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -98,6 +100,7 @@ bool GpuGraph::load_pipe(const char* name, uint32_t bindings,
   d.spv_path = shader_dir_ + "/" + name + ".spv";
   d.storage_bindings = bindings;
   d.push_constant_bytes = pc_bytes;
+  out.name = name;
   return vk::load_compute_pipeline(*ctx_, d, out.p, err_);
 }
 
@@ -212,7 +215,7 @@ const ink::vk::DescSet& GpuGraph::dset(const Pipe& p,
 }
 
 void GpuGraph::op(const Pipe& p, std::initializer_list<Bnd> bs, const void* pc,
-                  uint32_t pcb, uint32_t gx, uint32_t gy) {
+                  uint32_t pcb, uint32_t gx, uint32_t gy, const char* tag) {
   const vk::DescSet& ds = dset(p, bs);
   if (building_) return;
   rec_->bind_pipeline(p.p.pipe);
@@ -220,9 +223,11 @@ void GpuGraph::op(const Pipe& p, std::initializer_list<Bnd> bs, const void* pc,
   if (pcb) rec_->push_constants(p.p.layout, pc, pcb);
   rec_->dispatch(gx, gy);
   stats.dispatches++;
+  ts_mark(p.name, tag);
 }
 
-void GpuGraph::mv(const Pipe& p, Bnd w, Bnd x, Bnd o, int64_t M, int64_t K) {
+void GpuGraph::mv(const Pipe& p, Bnd w, Bnd x, Bnd o, int64_t M, int64_t K,
+                  const char* tag) {
   const vk::DescSet& ds = dset(p, {w, x, o});
   if (building_) return;
   rec_->bind_pipeline(p.p.pipe);
@@ -233,13 +238,130 @@ void GpuGraph::mv(const Pipe& p, Bnd w, Bnd x, Bnd o, int64_t M, int64_t K) {
     rec_->dispatch(uint32_t(std::min<int64_t>(M - m0, 65535)));
     stats.dispatches++;
   }
+  ts_mark(p.name, tag);
 }
 
 void GpuGraph::cp(const ink::vk::Buffer& s, VkDeviceSize so,
-                  const ink::vk::Buffer& d, VkDeviceSize dof, VkDeviceSize sz) {
+                  const ink::vk::Buffer& d, VkDeviceSize dof, VkDeviceSize sz,
+                  const char* tag) {
   if (building_) return;
   rec_->copy_buffer(s.buf, d.buf, sz, so, dof);
   stats.copies++;
+  ts_mark("copy", tag);
+}
+
+void GpuGraph::fill(const ink::vk::Buffer& d, VkDeviceSize off, VkDeviceSize sz,
+                    uint32_t data, const char* tag) {
+  if (building_) return;
+  rec_->fill_buffer(d.buf, off, sz, data);
+  ts_mark("fill", tag);
+}
+
+// ---- INK_GPU_TS: timestamp boundary after each recorded op ----
+
+// op-class for the grouped totals. The nvfp4/mxfp8 slot matvecs are expert
+// (MoE) weight GEMMs, so they group under moe_*, not dense matvec_*.
+static uint8_t ts_class(const char* name) {
+  if (!std::strcmp(name, "copy") || !std::strcmp(name, "fill")) return 5;
+  if (std::strstr(name, "nvfp4") || std::strstr(name, "mxfp8") ||
+      !std::strncmp(name, "moe", 3) || !std::strcmp(name, "router"))
+    return 3;
+  if (!std::strncmp(name, "matvec", 6)) return 0;
+  if (!std::strncmp(name, "conv4", 5)) return 1;
+  if (!std::strncmp(name, "attn", 4)) return 2;
+  return 4;
+}
+
+void GpuGraph::ts_mark(const char* name, const char* tag) {
+  if (!ts_en_) return;
+  const uint32_t slot = ts_next_++;
+  if (slot >= ts_cap_) return;  // pool exhausted: count but don't write
+  rec_->write_timestamp(ts_pool_, slot);
+  if (ts_segs_.size() < slot) {
+    // First instrumented emit: label this boundary once. Duplicate
+    // role names inside one scope get a ".N" suffix so every instance
+    // stays its own row in the report.
+    std::string base = cur_scope_;
+    base += '/';
+    base += tag ? tag : name;
+    int& seen = ts_dup_[base];
+    std::string l = seen ? base + "." + std::to_string(seen) : base;
+    seen++;
+    ts_segs_.push_back({std::move(l), ts_class(name), cur_phase_, 0.0});
+  }
+}
+
+void GpuGraph::ts_collect() {
+  const uint32_t n = std::min(ts_next_, ts_cap_);
+  if (n < 2) return;
+  VkResult r = vkGetQueryPoolResults(ctx_->device, ts_pool_, 0, n,
+                                     size_t(n) * sizeof(uint64_t),
+                                     ts_raw_.data(), sizeof(uint64_t),
+                                     VK_QUERY_RESULT_64_BIT);
+  if (r != VK_SUCCESS) {
+    std::fprintf(stderr, "gpu-ts: vkGetQueryPoolResults: %s\n",
+                 vk::result_name(r));
+    return;
+  }
+  double busy = 0;
+  const uint32_t m = std::min<uint32_t>(n - 1, uint32_t(ts_segs_.size()));
+  for (uint32_t i = 0; i < m; i++) {
+    const double ns = double(ts_raw_[i + 1] - ts_raw_[i]) * ts_period_;
+    ts_segs_[i].ms += ns;
+    busy += ns;
+  }
+  ts_gpu_ms_ += busy;
+  ts_tokens_++;
+  std::fprintf(stderr, "gpu-ts: token %llu gpu-busy %.2fms (%u segs)\n",
+               (unsigned long long)ts_tokens_, busy / 1e6, m);
+}
+
+void GpuGraph::ts_report() const {
+  if (!ts_en_ || ts_tokens_ == 0 || ts_segs_.empty()) return;
+  const double tok = double(ts_tokens_);
+  static const char* kCls[] = {"matvec_*", "conv4_*", "attn_*",
+                               "moe_*",    "elementwise", "copies"};
+  static const char* kPh[] = {"prelude", "pass0", "pass1",
+                              "pass2",   "coda",  "final"};
+  double cls_ms[6] = {}, ph_ms[6] = {};
+  for (const TsSeg& s : ts_segs_) {
+    cls_ms[s.cls] += s.ms;
+    ph_ms[s.phase] += s.ms;
+  }
+  const double busy_tok = ts_gpu_ms_ / 1e6 / tok;
+  std::fprintf(stderr,
+               "gpu-ts: ===== aggregate over %llu token(s) =====\n",
+               (unsigned long long)ts_tokens_);
+  std::fprintf(stderr,
+               "gpu-ts: gpu-busy %.2f ms/token  (host record %.2f ms, "
+               "wait %.2f ms per token)\n",
+               busy_tok, stats.record_ms / tok, stats.wait_ms / tok);
+  const double ndisp = double(stats.dispatches) / tok;
+  std::fprintf(stderr,
+               "gpu-ts: overhead-est: dispatches=%.0f, GPU-total=%.2fms, "
+               "per-dispatch=%.1fus\n",
+               ndisp, busy_tok, busy_tok * 1e3 / std::max(1.0, ndisp));
+  std::fprintf(stderr, "gpu-ts: -- by op-class (ms/token) --\n");
+  for (int k = 0; k < 6; k++)
+    std::fprintf(stderr, "gpu-ts:   %-12s %8.2f ms  %5.1f%%\n", kCls[k],
+                 cls_ms[k] / 1e6 / tok, 100.0 * cls_ms[k] / ts_gpu_ms_);
+  std::fprintf(stderr, "gpu-ts: -- by phase (ms/token) --\n");
+  for (int k = 0; k < 6; k++)
+    std::fprintf(stderr, "gpu-ts:   %-12s %8.2f ms  %5.1f%%\n", kPh[k],
+                 ph_ms[k] / 1e6 / tok, 100.0 * ph_ms[k] / ts_gpu_ms_);
+  std::vector<uint32_t> ord(ts_segs_.size());
+  for (uint32_t i = 0; i < ord.size(); i++) ord[i] = i;
+  std::sort(ord.begin(), ord.end(), [&](uint32_t a, uint32_t b) {
+    return ts_segs_[a].ms > ts_segs_[b].ms;
+  });
+  std::fprintf(stderr, "gpu-ts: -- top-25 stages (ms/token) --\n");
+  const uint32_t top = std::min<uint32_t>(25, uint32_t(ord.size()));
+  for (uint32_t i = 0; i < top; i++) {
+    const TsSeg& s = ts_segs_[ord[i]];
+    std::fprintf(stderr, "gpu-ts:   %2u %-24s %-11s %-7s %8.3f ms  %4.1f%%\n",
+                 i + 1, s.label.c_str(), kCls[s.cls], kPh[s.phase],
+                 s.ms / 1e6 / tok, 100.0 * s.ms / ts_gpu_ms_);
+  }
 }
 
 void GpuGraph::sync() {
@@ -261,17 +383,21 @@ void GpuGraph::emit_visit(int i, int p, int64_t pos) {
   const Lw& L = lw_[i];
   const float eps = float(c.rms_norm_eps);
   const uint32_t rank = uint32_t(c.loop.gate_rank);
+  // INK_GPU_TS scope: v0-5 prelude, v6-17/18-29/30-41 pass0-2, v42-47 coda.
+  cur_scope_ = "v" + std::to_string(vidx);
+  cur_phase_ = vidx < 6 ? 0 : vidx < 18 ? 1 : vidx < 30 ? 2 : vidx < 42 ? 3 : 4;
 
   // visit-input taps (vidx 5/23/41) + per-visit dump row
   if (vidx == 5 || vidx == 23 || vidx == 41) {
     const int j = vidx == 5 ? 0 : vidx == 23 ? 1 : 2;
-    cp(partial_, 0, readback_, (V_ + int64_t(j) * H) * 4, Hb);
+    cp(partial_, 0, readback_, (V_ + int64_t(j) * H) * 4, Hb, "tap_in");
   }
-  cp(partial_, 0, readback_, (rb_vis_ + int64_t(vidx * 2) * H) * 4, Hb);
+  cp(partial_, 0, readback_, (rb_vis_ + int64_t(vidx * 2) * H) * 4, Hb,
+     "dump_in");
   const bool dbg = dbg_en_ && vidx == 5;
   auto dbg_cp = [&](const vk::Buffer& s, int row) {
     if (dbg && !building_)
-      cp(s, 0, readback_, (rb_dbg_ + int64_t(row) * H) * 4, s.size);
+      cp(s, 0, readback_, (rb_dbg_ + int64_t(row) * H) * 4, s.size, "dbg");
   };
 
   // messages from the previous pass (loop layers only)
@@ -280,7 +406,7 @@ void GpuGraph::emit_visit(int i, int p, int64_t pos) {
     op(p_ares_,
        {BW(bank_), BA(msgq_, int64_t(i - c.loop.core_start) * 4 * H, 4 * H),
         BW(msgs_)},
-       &pc, sizeof(pc), 1);
+       &pc, sizeof(pc), 1, 1, "ares_msg");
     sync();
   }
 
@@ -288,16 +414,16 @@ void GpuGraph::emit_visit(int i, int p, int64_t pos) {
   // x_in always lands in the next block row — it is BOTH the last source
   // AND the pending boundary push (row nb0 is committed at i%6==0).
   const int nb0 = nblock_;
-  cp(partial_, 0, block_, int64_t(nb0) * Hb, Hb);
+  cp(partial_, 0, block_, int64_t(nb0) * Hb, Hb, "blk_app");
   if (i > 0) {
     sync();
     sh::PcAttnRes pc{uint32_t(nb0 + 1), uint32_t(H), L.full ? 3u : 1u};
     op(p_ares_,
        {BW(block_), BA(attnq_, int64_t(i - 1) * 3 * H, int64_t(pc.Q) * H),
         BW(reads_)},
-       &pc, sizeof(pc), 1);
+       &pc, sizeof(pc), 1, 1, "ares_rd");
   } else {
-    cp(partial_, 0, reads_, 0, Hb);
+    cp(partial_, 0, reads_, 0, Hb, "rd_copy");
   }
   sync();
 
@@ -314,7 +440,7 @@ void GpuGraph::emit_visit(int i, int p, int64_t pos) {
          {BW(*L.ctrl[st][0]), BW(*L.ctrl[st][1]), BW(*L.ctrl[st][2]),
           BA(reads_, (L.full ? st : 0) * H, H), BA(msgs_, int64_t(st) * H, H),
           BA(mgated_, int64_t(st) * H, H)},
-         &pc, sizeof(pc), 1);
+         &pc, sizeof(pc), 1, 1, "msg_gate");
     }
     sync();
     for (int st = 0; st < 3; st++) {
@@ -323,10 +449,10 @@ void GpuGraph::emit_visit(int i, int p, int64_t pos) {
         op(p_rms_,
            {BA(mgated_, int64_t(st) * H, H), BW(*L.norms[st]),
             BA(inbuf_, int64_t(st) * H, H)},
-           &pc, sizeof(pc), 1);
+           &pc, sizeof(pc), 1, 1, "norm_in");
       else if (st == 0)
         op(p_rms_, {BW(mgated_), BW(*L.norms[0]), BW(inbuf_)}, &pc, sizeof(pc),
-           3);
+           3, 1, "norm_in");
     }
   } else {
     for (int st = 0; st < 3; st++) {
@@ -335,56 +461,58 @@ void GpuGraph::emit_visit(int i, int p, int64_t pos) {
         op(p_rms_,
            {BA(reads_, int64_t(st) * H, H), BW(*L.norms[st]),
             BA(inbuf_, int64_t(st) * H, H)},
-           &pc, sizeof(pc), 1);
+           &pc, sizeof(pc), 1, 1, "norm_in");
       else if (st == 0)
         op(p_rms_, {BW(reads_), BW(*L.norms[0]), BW(inbuf_)}, &pc, sizeof(pc),
-           1);
+           1, 1, "norm_in");
     }
   }
   sync();
 
   // ---------------- attention (ops::attn_step mirror) ----------------
-  mv(*L.wq.p, BW(*L.wq.b), BA(inbuf_, xo[0], H), BW(q_), 3072, H);
-  mv(*L.wk.p, BW(*L.wk.b), BA(inbuf_, xo[1], H), BW(k_), 1024, H);
-  mv(*L.wv.p, BW(*L.wv.b), BA(inbuf_, xo[2], H), BW(v_), 1024, H);
-  mv(*L.wr.p, BW(*L.wr.b), BA(inbuf_, xo[0], H), BW(r_), 384, H);
+  mv(*L.wq.p, BW(*L.wq.b), BA(inbuf_, xo[0], H), BW(q_), 3072, H, "wq");
+  mv(*L.wk.p, BW(*L.wk.b), BA(inbuf_, xo[1], H), BW(k_), 1024, H, "wk");
+  mv(*L.wv.p, BW(*L.wv.b), BA(inbuf_, xo[2], H), BW(v_), 1024, H, "wv");
+  mv(*L.wr.p, BW(*L.wr.b), BA(inbuf_, xo[0], H), BW(r_), 384, H, "wr");
   sync();
 
   const int Ckv = 1024;  // hidden_size/... kv width (HK*DH)
   dbg_cp(k_, 14);        // pre-conv k (visit5)
   if (L.full) {
-    mv(*L.kconv_wp.p, BW(*L.kconv_wp.b), BA(inbuf_, xo[1], H), BW(tk_), 32, H);
-    mv(*L.vconv_wp.p, BW(*L.vconv_wp.b), BA(inbuf_, xo[2], H), BW(tv_), 32, H);
+    mv(*L.kconv_wp.p, BW(*L.kconv_wp.b), BA(inbuf_, xo[1], H), BW(tk_), 32, H,
+       "kconp");
+    mv(*L.vconv_wp.p, BW(*L.vconv_wp.b), BA(inbuf_, xo[2], H), BW(tv_), 32, H,
+       "vconp");
     sync();
     sh::PcConv4Dyn pk{uint32_t(Ckv), 128u, uint32_t(conv_filled_[slot][0]),
                       sh::F_UPDATE};
     op(p_cvd_, {BW(k_), BW(*L.kconv_sw), BW(tk_), histb(slot, 0, Ckv), BW(k_)},
-       &pk, sizeof(pk), wg64(Ckv));
+       &pk, sizeof(pk), wg64(Ckv), 1, "kconv");
     sh::PcConv4Dyn pv{uint32_t(Ckv), 128u, uint32_t(conv_filled_[slot][1]),
                       sh::F_UPDATE};
     op(p_cvd_, {BW(v_), BW(*L.vconv_sw), BW(tv_), histb(slot, 1, Ckv), BW(v_)},
-       &pv, sizeof(pv), wg64(Ckv));
+       &pv, sizeof(pv), wg64(Ckv), 1, "vconv");
   } else {
     sh::PcConv4Static pk{uint32_t(Ckv), uint32_t(conv_filled_[slot][0]),
                          sh::F_UPDATE};
     op(p_cvs_, {BW(k_), BW(*L.kconv_w), histb(slot, 0, Ckv), BW(k_)}, &pk,
-       sizeof(pk), wg64(Ckv));
+       sizeof(pk), wg64(Ckv), 1, "kconv");
     sh::PcConv4Static pv{uint32_t(Ckv), uint32_t(conv_filled_[slot][1]),
                          sh::F_UPDATE};
     op(p_cvs_, {BW(v_), BW(*L.vconv_w), histb(slot, 1, Ckv), BW(v_)}, &pv,
-       sizeof(pv), wg64(Ckv));
+       sizeof(pv), wg64(Ckv), 1, "vconv");
   }
   sync();
 
   {
     PcClip cq{128u, float(c.qk_l2_clip_threshold), sh::F_USE_SCALE};
-    op(p_l2_, {BW(q_), BW(*L.qclip)}, &cq, sizeof(cq), 24);
+    op(p_l2_, {BW(q_), BW(*L.qclip)}, &cq, sizeof(cq), 24, 1, "clip_q");
     PcClip ck{128u, float(c.qk_l2_clip_threshold), 0u};
-    op(p_l2_, {BW(k_), BW(dummy4_)}, &ck, sizeof(ck), 8);
+    op(p_l2_, {BW(k_), BW(dummy4_)}, &ck, sizeof(ck), 8, 1, "clip_k");
     PcClip cr{16u, float(c.rel_l2_clip_threshold), sh::F_USE_SCALE};
-    op(p_l2_, {BW(r_), BW(*L.rclip)}, &cr, sizeof(cr), 24);
+    op(p_l2_, {BW(r_), BW(*L.rclip)}, &cr, sizeof(cr), 24, 1, "clip_r");
     sh::PcRmsnorm cv{128u, eps, 0u};  // per-head unweighted v norm
-    op(p_rms_, {BW(v_), BW(dummy4_), BW(v_)}, &cv, sizeof(cv), 8);
+    op(p_rms_, {BW(v_), BW(dummy4_), BW(v_)}, &cv, sizeof(cv), 8, 1, "norm_v");
   }
   sync();
 
@@ -393,9 +521,9 @@ void GpuGraph::emit_visit(int i, int p, int64_t pos) {
         1.0 + c.log_scaling_alpha *
                   std::log(std::max(double(pos + 1) / c.log_scaling_n_floor, 1.0));
     PcTau pq{3072u, float(tau)};
-    op(p_log_, {BW(q_)}, &pq, sizeof(pq), wg64(3072));
+    op(p_log_, {BW(q_)}, &pq, sizeof(pq), wg64(3072), 1, "log_q");
     PcTau pr{384u, float(tau)};
-    op(p_log_, {BW(r_)}, &pr, sizeof(pr), wg64(384));
+    op(p_log_, {BW(r_)}, &pr, sizeof(pr), wg64(384), 1, "log_r");
     sync();
   }
 
@@ -404,38 +532,40 @@ void GpuGraph::emit_visit(int i, int p, int64_t pos) {
       L.full ? 0 : std::max<int64_t>(0, len - c.sliding_window_size);
   const uint32_t n = uint32_t(len - j0), pstr = n + 1;
   cp(k_, 0, kvk_, kvb(kvk_, slot).off + VkDeviceSize(kv_len_[slot]) * 4096,
-     4096);
+     4096, "kv_k");
   cp(v_, 0, kvv_, kvb(kvv_, slot).off + VkDeviceSize(kv_len_[slot]) * 4096,
-     4096);
+     4096, "kv_v");
   {
     sh::PcRelBias pc{16u, 1024u, 24u * 1024u};
     op(p_rel_, {BW(r_), BW(*L.relproj), BW(rel_)}, &pc, sizeof(pc),
-       wg64(24 * 1024));
+       wg64(24 * 1024), 1, "relbias");
   }
-  mv(*L.gate.p, BW(*L.gate.b), BA(inbuf_, xo[0], H), BW(grate_), 3072, H);
-  mv(*L.sink.p, BW(*L.sink.b), BA(inbuf_, xo[0], H), BW(sink_), 24, H);
+  mv(*L.gate.p, BW(*L.gate.b), BA(inbuf_, xo[0], H), BW(grate_), 3072, H,
+     "gate");
+  mv(*L.sink.p, BW(*L.sink.b), BA(inbuf_, xo[0], H), BW(sink_), 24, H, "sink");
   sync();
 
   {
     sh::PcAttnScores pc{24u, 8u, 128u, uint32_t(j0), n, uint32_t(pos), 1024u,
                         pstr};
     op(p_sco_, {BW(q_), kvb(kvk_, slot), BW(rel_), BW(probs_)}, &pc,
-       sizeof(pc), 24, (n + 63) / 64);
+       sizeof(pc), 24, (n + 63) / 64, "scores");
   }
   sync();
   {
     sh::PcAttnSoftmax pc{n, pstr};
-    op(p_smx_, {BW(probs_), BW(sink_)}, &pc, sizeof(pc), 24);
+    op(p_smx_, {BW(probs_), BW(sink_)}, &pc, sizeof(pc), 24, 1, "softmax");
   }
   sync();
   {
     sh::PcAttnAccum pc{24u, 8u, 128u, uint32_t(j0), n, pstr};
-    op(p_acc_, {BW(probs_), kvb(kvv_, slot), BW(o_)}, &pc, sizeof(pc), 24);
+    op(p_acc_, {BW(probs_), kvb(kvv_, slot), BW(o_)}, &pc, sizeof(pc), 24, 1,
+       "accum");
   }
   sync();
   {
     PcN pc{3072u};
-    op(p_sig_, {BW(o_), BW(grate_)}, &pc, sizeof(pc), wg64(3072));
+    op(p_sig_, {BW(o_), BW(grate_)}, &pc, sizeof(pc), wg64(3072), 1, "ogate");
   }
   sync();
   if (dbg && !building_) {
@@ -446,14 +576,14 @@ void GpuGraph::emit_visit(int i, int p, int64_t pos) {
   dbg_cp(k_, 2);
   dbg_cp(v_, 3);
   dbg_cp(o_, 4);
-  mv(*L.wo.p, BW(*L.wo.b), BW(o_), BW(attn_out_), H, 3072);
+  mv(*L.wo.p, BW(*L.wo.b), BW(o_), BW(attn_out_), H, 3072, "wo");
   sync();
   dbg_cp(attn_out_, 7);
   {
     sh::PcConv4Static pc{uint32_t(H), uint32_t(conv_filled_[slot][2]),
                          sh::F_UPDATE};
     op(p_cvs_, {BW(attn_out_), BW(*L.attn_sconv), histb(slot, 2, H), BW(a_out_)},
-       &pc, sizeof(pc), wg64(H));
+       &pc, sizeof(pc), wg64(H), 1, "attn_conv");
   }
   sync();
 
@@ -465,11 +595,11 @@ void GpuGraph::emit_visit(int i, int p, int64_t pos) {
   } else {
     PcN pc{uint32_t(H)};
     op(p_add_, {BW(partial_), BW(a_out_), BW(residual_)}, &pc, sizeof(pc),
-       wg64(H));
+       wg64(H), 1, "resid");
     sync();
     resid = &residual_;
   }
-  cp(*resid, 0, block_, int64_t(nblock_) * Hb, Hb);
+  cp(*resid, 0, block_, int64_t(nblock_) * Hb, Hb, "blk_push");
   sync();
   dbg_cp(*resid, 8);
 
@@ -477,7 +607,7 @@ void GpuGraph::emit_visit(int i, int p, int64_t pos) {
   {
     sh::PcAttnRes pc{uint32_t(nblock_ + 1), uint32_t(H), 1u};
     op(p_ares_, {BW(block_), BA(mlpq_, int64_t(i) * H, H), BW(m_in_)}, &pc,
-       sizeof(pc), 1);
+       sizeof(pc), 1, 1, "ares_mlp");
   }
   sync();
   dbg_cp(m_in_, 9);
@@ -487,14 +617,15 @@ void GpuGraph::emit_visit(int i, int p, int64_t pos) {
     op(p_msg_,
        {BW(*L.ctrl[3][0]), BW(*L.ctrl[3][1]), BW(*L.ctrl[3][2]), BW(m_in_),
         BA(msgs_, 3 * H, H), BA(mgated_, 3 * H, H)},
-       &pcg, sizeof(pcg), 1);
+       &pcg, sizeof(pcg), 1, 1, "msg_mlp");
     sync();
     sh::PcRmsnorm pc{uint32_t(H), eps, sh::F_USE_GAMMA};
     op(p_rms_, {BA(mgated_, 3 * H, H), BW(*L.mlp_norm), BW(mn_)}, &pc,
-       sizeof(pc), 1);
+       sizeof(pc), 1, 1, "norm_mlp");
   } else {
     sh::PcRmsnorm pc{uint32_t(H), eps, sh::F_USE_GAMMA};
-    op(p_rms_, {BW(m_in_), BW(*L.mlp_norm), BW(mn_)}, &pc, sizeof(pc), 1);
+    op(p_rms_, {BW(m_in_), BW(*L.mlp_norm), BW(mn_)}, &pc, sizeof(pc), 1, 1,
+       "norm_mlp");
   }
   sync();
   dbg_cp(mn_, 10);
@@ -502,7 +633,7 @@ void GpuGraph::emit_visit(int i, int p, int64_t pos) {
   {
     sh::PcRouter pc{128u, 8u, uint32_t(H), float(c.route_scale)};
     op(p_rtr_, {BW(*L.router_w), BW(*L.router_b), BW(mn_), BW(ridx_), BW(rw_)},
-       &pc, sizeof(pc), 1);
+       &pc, sizeof(pc), 1, 1, "router");
   }
   sync();
   if (dbg && !building_) {
@@ -511,7 +642,7 @@ void GpuGraph::emit_visit(int i, int p, int64_t pos) {
   }
 
   // MoE: zero the accumulator, then per-slot gate/up + serial accumulate.
-  if (!building_) rec_->fill_buffer(moe_out_.buf, 0, Hb, 0u);
+  fill(moe_out_, 0, Hb, 0u, "moe_zero");
   const Pipe& p13 = L.mxfp8 ? p_mx8s_ : p_nv4s_;
   const int64_t I = c.intermediate_size;
   for (uint32_t s = 0; s < 8; s++) {
@@ -520,23 +651,23 @@ void GpuGraph::emit_visit(int i, int p, int64_t pos) {
       op(p13,
          {BW(*L.w13), BW(*L.w13s), BW(mn_), BA(gate_, int64_t(s) * I, I),
           BW(ridx_)},
-         &pg, sizeof(pg), uint32_t(I));
+         &pg, sizeof(pg), uint32_t(I), 1, "w13");
       sh::PcMxfp8 pu{s, uint32_t(L.w13R), uint32_t(H), 1u, 2u, 1.f, 0u};
       op(p13,
          {BW(*L.w13), BW(*L.w13s), BW(mn_), BA(up_, int64_t(s) * I, I),
           BW(ridx_)},
-         &pu, sizeof(pu), uint32_t(I));
+         &pu, sizeof(pu), uint32_t(I), 1, "w13");
     } else {
       sh::PcNvfp4 pg{s, uint32_t(L.w13R), uint32_t(H), 0u, 2u, 1.f, 0u};
       op(p13,
          {BW(*L.w13), BW(*L.w13s), BW(*L.w13a), BW(*L.w13o), BW(mn_),
           BA(gate_, int64_t(s) * I, I), BW(ridx_)},
-         &pg, sizeof(pg), uint32_t(I));
+         &pg, sizeof(pg), uint32_t(I), 1, "w13");
       sh::PcNvfp4 pu{s, uint32_t(L.w13R), uint32_t(H), 1u, 2u, 1.f, 0u};
       op(p13,
          {BW(*L.w13), BW(*L.w13s), BW(*L.w13a), BW(*L.w13o), BW(mn_),
           BA(up_, int64_t(s) * I, I), BW(ridx_)},
-         &pu, sizeof(pu), uint32_t(I));
+         &pu, sizeof(pu), uint32_t(I), 1, "w13");
     }
   }
   sync();
@@ -546,7 +677,7 @@ void GpuGraph::emit_visit(int i, int p, int64_t pos) {
     op(p_moe_,
        {BA(gate_, int64_t(s) * I, I), BA(up_, int64_t(s) * I, I), BW(*L.w2),
         BW(*L.w2s), BW(*L.w2a), BW(*L.w2o), BW(moe_out_), BW(ridx_), BW(rw_)},
-       &pc, sizeof(pc), uint32_t(H));
+       &pc, sizeof(pc), uint32_t(H), 1, "w2");
     sync();  // serial: each slot does += on moe_out
   }
   dbg_cp(moe_out_, 11);
@@ -554,17 +685,19 @@ void GpuGraph::emit_visit(int i, int p, int64_t pos) {
     sh::PcConv4Static pc{uint32_t(H), uint32_t(conv_filled_[slot][3]),
                          sh::F_UPDATE};
     op(p_cvs_, {BW(moe_out_), BW(*L.mlp_sconv), histb(slot, 3, H), BW(mo_)},
-       &pc, sizeof(pc), wg64(H));
+       &pc, sizeof(pc), wg64(H), 1, "mlp_conv");
   }
   sync();
   dbg_cp(mo_, 12);
   {
     PcN pc{uint32_t(H)};
-    op(p_add_, {BW(*resid), BW(mo_), BW(partial_)}, &pc, sizeof(pc), wg64(H));
+    op(p_add_, {BW(*resid), BW(mo_), BW(partial_)}, &pc, sizeof(pc), wg64(H),
+       1, "out_add");
   }
   sync();
 
-  cp(partial_, 0, readback_, (rb_vis_ + int64_t(vidx * 2 + 1) * H) * 4, Hb);
+  cp(partial_, 0, readback_, (rb_vis_ + int64_t(vidx * 2 + 1) * H) * 4, Hb,
+     "dump_out");
 
   kv_len_[slot]++;
   for (int st = 0; st < 4; st++)
@@ -577,29 +710,35 @@ void GpuGraph::emit_token(int token, int64_t pos) {
   const int64_t Hb = int64_t(H) * 4;
   nblock_ = 0;
 
+  cur_scope_ = "pre";  // INK_GPU_TS: non-visit sections get an explicit scope
+  cur_phase_ = 0;
   {
     PcEmb pc{uint32_t(token), uint32_t(H), float(c.rms_norm_eps), emb_flags_};
-    op(p_emb_, {BW(embedw_), BW(embn_), BW(partial_)}, &pc, sizeof(pc), 1);
+    op(p_emb_, {BW(embedw_), BW(embn_), BW(partial_)}, &pc, sizeof(pc), 1, 1,
+       "embed");
   }
   sync();
 
   for (int i = 0; i < c.loop.core_start; i++) emit_visit(i, 0, pos);
 
   // prelude snapshot: pre_partial = partial; pre_block = block
-  cp(partial_, 0, pre_partial_, 0, Hb);
+  cur_scope_ = "snap";
+  cp(partial_, 0, pre_partial_, 0, Hb, "snap_p");
   pre_nblock_ = nblock_;
   for (int r = 0; r < nblock_; r++)
-    cp(block_, int64_t(r) * Hb, pre_block_, int64_t(r) * Hb, Hb);
+    cp(block_, int64_t(r) * Hb, pre_block_, int64_t(r) * Hb, Hb, "snap_b");
   sync();
 
   for (int p = 0; p < c.loop.num_passes; p++) {
     if (p > 0) {
       // bank0 = block.back() (last loop-boundary block), bank1 = prev partial
-      cp(block_, int64_t(nblock_ - 1) * Hb, bank_, 0, Hb);
-      cp(partial_, 0, bank_, Hb, Hb);
-      cp(pre_partial_, 0, partial_, 0, Hb);
+      cur_scope_ = "bank";
+      cur_phase_ = uint8_t(1 + p);  // restore work belongs to this pass
+      cp(block_, int64_t(nblock_ - 1) * Hb, bank_, 0, Hb, "bank0");
+      cp(partial_, 0, bank_, Hb, Hb, "bank1");
+      cp(pre_partial_, 0, partial_, 0, Hb, "rst_p");
       for (int r = 0; r < pre_nblock_; r++)
-        cp(pre_block_, int64_t(r) * Hb, block_, int64_t(r) * Hb, Hb);
+        cp(pre_block_, int64_t(r) * Hb, block_, int64_t(r) * Hb, Hb, "rst_b");
       nblock_ = pre_nblock_;
       sync();
     }
@@ -610,27 +749,31 @@ void GpuGraph::emit_token(int token, int64_t pos) {
     emit_visit(i, 0, pos);
 
   // final learned attn_res read + rmsnorm + unembed + softcap
-  cp(partial_, 0, block_, int64_t(nblock_) * Hb, Hb);
+  cur_scope_ = "fin";
+  cur_phase_ = 5;
+  cp(partial_, 0, block_, int64_t(nblock_) * Hb, Hb, "blk_fin");
   sync();
   {
     sh::PcAttnRes pc{uint32_t(nblock_ + 1), uint32_t(H), 1u};
-    op(p_ares_, {BW(block_), BW(outq_), BW(h_)}, &pc, sizeof(pc), 1);
+    op(p_ares_, {BW(block_), BW(outq_), BW(h_)}, &pc, sizeof(pc), 1, 1,
+       "ares_fin");
   }
   sync();
   {
     sh::PcRmsnorm pc{uint32_t(H), float(c.rms_norm_eps), sh::F_USE_GAMMA};
-    op(p_rms_, {BW(h_), BW(normw_), BW(hfin_)}, &pc, sizeof(pc), 1);
+    op(p_rms_, {BW(h_), BW(normw_), BW(hfin_)}, &pc, sizeof(pc), 1, 1,
+       "norm_fin");
   }
   sync();
-  cp(hfin_, 0, readback_, (V_ + 3 * int64_t(H)) * 4, Hb);
-  mv(*unemb_mv_.p, BW(*unemb_mv_.b), BW(hfin_), BW(logits_), V_, H);
+  cp(hfin_, 0, readback_, (V_ + 3 * int64_t(H)) * 4, Hb, "tap_fin");
+  mv(*unemb_mv_.p, BW(*unemb_mv_.b), BW(hfin_), BW(logits_), V_, H, "unemb");
   sync();
   {
     PcCap pc{uint32_t(V_), float(c.final_logit_softcapping)};
-    op(p_cap_, {BW(logits_)}, &pc, sizeof(pc), wg64(V_));
+    op(p_cap_, {BW(logits_)}, &pc, sizeof(pc), wg64(V_), 1, "softcap");
   }
   sync();
-  cp(logits_, 0, readback_, 0, VkDeviceSize(V_) * 4);
+  cp(logits_, 0, readback_, 0, VkDeviceSize(V_) * 4, "logits");
 }
 
 // -------------------------------------------------------------------- api
@@ -657,6 +800,12 @@ const std::vector<float>& GpuGraph::forward_token(int token, int64_t pos) {
   site_cursor_ = 0;
   building_ = false;
   const auto t0 = clk::steady_clock::now();
+  if (ts_en_) {
+    // slot 0 = cb start; slots 1.. = one mark after each recorded op.
+    rec_->reset_query_pool(ts_pool_, 0, ts_cap_);
+    rec_->write_timestamp(ts_pool_, 0);
+    ts_next_ = 1;
+  }
   emit_token(token, pos);
   stats.record_ms +=
       clk::duration<double, std::milli>(clk::steady_clock::now() - t0).count();
@@ -670,6 +819,7 @@ const std::vector<float>& GpuGraph::forward_token(int token, int64_t pos) {
   stats.wait_ms +=
       clk::duration<double, std::milli>(clk::steady_clock::now() - w0).count();
   stats.submits++;
+  if (ts_en_) ts_collect();
   rec_ = nullptr;
   rec.shutdown();
   alloc_->invalidate(readback_);
@@ -969,6 +1119,43 @@ bool GpuGraph::init(const ModelConfig& c, const WeightStore& w,
 
   // ------------------------- build pass: create the fixed descset stream
   dbg_en_ = std::getenv("INK_DBG") != nullptr;
+
+  // INK_GPU_TS=1: timestamp pool covering every op boundary in the token cb.
+  // Everything downstream checks ts_en_; without the env var not a single
+  // command reaches the recorded buffer.
+  if (const char* e = std::getenv("INK_GPU_TS");
+      e && e[0] && std::strcmp(e, "0") != 0) {
+    uint32_t valid_bits = 0;
+    uint32_t nq = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(ctx.phys, &nq, nullptr);
+    std::vector<VkQueueFamilyProperties> qf(nq);
+    vkGetPhysicalDeviceQueueFamilyProperties(ctx.phys, &nq, qf.data());
+    if (ctx.compute_family < nq)
+      valid_bits = qf[ctx.compute_family].timestampValidBits;
+    if (valid_bits == 0 || ctx.props.limits.timestampPeriod <= 0.f) {
+      std::fprintf(stderr,
+                   "gpu-ts: timestamps unsupported on the compute queue; "
+                   "disabled\n");
+    } else {
+      VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+      qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+      qi.queryCount = 8192;  // ~5.2k dispatches + copies + fills + cb start
+      if (vkCreateQueryPool(ctx.device, &qi, nullptr, &ts_pool_) ==
+          VK_SUCCESS) {
+        ts_en_ = true;
+        ts_cap_ = 8192;
+        ts_period_ = ctx.props.limits.timestampPeriod;
+        ts_raw_.assign(ts_cap_, 0);
+        std::fprintf(stderr,
+                     "gpu-ts: on (timestampPeriod %.3f ns, %u slots, %u "
+                     "valid bits)\n",
+                     ts_period_, ts_cap_, valid_bits);
+      } else {
+        std::fprintf(stderr, "gpu-ts: vkCreateQueryPool failed; disabled\n");
+      }
+    }
+  }
+
   logits_host_.assign(size_t(V_), 0.f);
   building_ = true;
   emit_token(0, 0);
@@ -985,6 +1172,12 @@ bool GpuGraph::init(const ModelConfig& c, const WeightStore& w,
 void GpuGraph::shutdown() {
   if (!ctx_ || !ctx_->device) return;
   vkDeviceWaitIdle(ctx_->device);
+  if (ts_en_) {
+    ts_report();
+    vkDestroyQueryPool(ctx_->device, ts_pool_, nullptr);
+    ts_pool_ = VK_NULL_HANDLE;
+    ts_en_ = false;
+  }
   for (auto& kv : devw_) alloc_->free(kv.second);
   for (auto& kv : hostw_) alloc_->free(kv.second);
   for (auto& kv : f32w_) alloc_->free(kv.second);

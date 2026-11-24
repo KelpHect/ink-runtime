@@ -56,6 +56,13 @@ class Recorder {
                VkAccessFlags dst_access);
   void compute_barrier();  // SHADER_WRITE -> SHADER_READ|TRANSFER_READ
 
+  // Timestamp instrumentation (INK_GPU_TS): record a timestamp write and a
+  // query-pool reset into the command buffer. The pool is caller-owned.
+  void write_timestamp(VkQueryPool pool, uint32_t slot,
+                       VkPipelineStageFlags stage =
+                           VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+  void reset_query_pool(VkQueryPool pool, uint32_t first, uint32_t count);
+
   bool end();
   bool submit(VkQueue q);                    // submit recorded buffer, no wait
   bool submit_and_wait(VkQueue q);           // end() if needed + fence wait
